@@ -283,15 +283,31 @@ where
         for row_idx in 0..self.m {
             for column_idx in 0..self.p {
                 for idx in 0..self.n {
-                    builder.when_transition().assert_zero(
-                        (current[i] - AB::Expr::from_canonical_usize(row_idx))
-                            + (current[j] - AB::Expr::from_canonical_usize(column_idx))
-                            + (current[k] - AB::Expr::from_canonical_usize(idx))
-                            + (next[sum]
-                                - (current[sum]
-                                    + current[row_idx * self.n + idx]
-                                        * current[self.m * self.n + idx * self.p + column_idx])),
-                    );
+                    // The running sum is applied after the first index in the inner product
+                    // of the row of matrix A and the column of matrix B
+                    if idx != 0 {
+                        builder.when_transition().assert_zero(
+                            (current[i] - AB::Expr::from_canonical_usize(row_idx))
+                                + (current[j] - AB::Expr::from_canonical_usize(column_idx))
+                                + (current[k] - AB::Expr::from_canonical_usize(idx))
+                                + (next[sum]
+                                    - (current[sum]
+                                        + current[row_idx * self.n + idx]
+                                            * current
+                                                [self.m * self.n + idx * self.p + column_idx])),
+                        );
+                    // The first number for the running sum is the multiplication of the
+                    // first element in row row_idx and the first elementin colum column_idx
+                    } else {
+                        builder.when_transition().assert_zero(
+                            (current[i] - AB::Expr::from_canonical_usize(row_idx))
+                                + (current[j] - AB::Expr::from_canonical_usize(column_idx))
+                                + (current[k] - AB::Expr::from_canonical_usize(idx))
+                                + (current[sum]
+                                    - current[row_idx * self.n + idx]
+                                        * current[self.m * self.n + idx * self.p + column_idx]),
+                        );
+                    }
                 }
             }
         }
