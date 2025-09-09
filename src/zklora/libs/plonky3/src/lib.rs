@@ -1,17 +1,17 @@
 use p3_air::{Air, AirBuilder, BaseAir};
 use p3_baby_bear::BabyBear;
-use p3_field::{AbstractField, PrimeField, extension::BinomialExtensionField};
-use p3_matrix::{dense::RowMajorMatrix, Matrix};
-use p3_keccak::Keccak256Hash;
-use p3_symmetric::SerializingHasher32;
-use p3_symmetric::CompressionFunctionFromHasher;
-use p3_merkle_tree::FieldMerkleTreeMmcs;
-use p3_commit::ExtensionMmcs;
 use p3_challenger::HashChallenger;
 use p3_challenger::SerializingChallenger32;
 use p3_circle::CirclePcs;
-use p3_uni_stark::StarkConfig;
+use p3_commit::ExtensionMmcs;
+use p3_field::{extension::BinomialExtensionField, AbstractField, PrimeField};
 use p3_fri::FriConfig;
+use p3_keccak::Keccak256Hash;
+use p3_matrix::{dense::RowMajorMatrix, Matrix};
+use p3_merkle_tree::FieldMerkleTreeMmcs;
+use p3_symmetric::CompressionFunctionFromHasher;
+use p3_symmetric::SerializingHasher32;
+use p3_uni_stark::StarkConfig;
 
 /// Performs matrix multiplication between two matrices of u16 elements.
 ///
@@ -64,7 +64,6 @@ pub struct MatrixMultiplicationAIR<F: PrimeField> {
     pub field_hash: FieldHash,
     /// Field element type
     _phantom: std::marker::PhantomData<F>,
-    
 }
 
 // Field
@@ -90,11 +89,8 @@ type Pcs = CirclePcs<Val, ValMmcs, ChallengeMmcs>;
 // Defines the overall STARK configuration type.
 type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
 
-
-
 impl<F: PrimeField> MatrixMultiplicationAIR<F> {
     pub fn new(m: usize, n: usize, p: usize) -> Self {
-        
         // Declaring an empty hash and its serializer.
         let byte_hash = ByteHash {};
         // Declaring Field hash function, it is used to hash field elements in the proof system
@@ -120,7 +116,7 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
         };
         // Creates the STARK configuration instance.
         let config = MyConfig::new(pcs);
-        
+
         Self {
             m,
             n,
@@ -153,8 +149,8 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
     /// # Returns
     /// A matrix representing the execution trace, where each row is a step in the computation
     /// and columns correspond to:
-    /// - Columns 0..(m*n): All elements from matrix A
-    /// - Columns (m*n)..(m*n+n*p): All elements from matrix B
+    /// - Columns 0..(m*n)-1: All elements from matrix A
+    /// - Columns (m*n)..(m*n+n*p)-1: All elements from matrix B
     /// - Column trace_width()-4: Row index (i)
     /// - Column trace_width()-3: Column index (j)
     /// - Column trace_width()-2: Current position k in the dot product
@@ -260,7 +256,7 @@ where
         // Assert that the sum column of the first element of A and B multiplied
         builder
             .when_first_row()
-            .assert_eq(current[sum], current[0] * current[0]);
+            .assert_eq(current[sum], current[0] * current[self.m * self.n]);
 
         // Assert that the row index is 0
         builder
@@ -341,12 +337,18 @@ where
                     + (next[j] - AB::Expr::zero())
                     + (next[k] - AB::Expr::zero()),
             );
-        
+
         // Enforce finale state
         // Assert that columns i,j,k are all 1
-        builder.when_last_row().assert_eq(current[i], AB::Expr::one());
-        builder.when_last_row().assert_eq(current[j], AB::Expr::one());
-        builder.when_last_row().assert_eq(current[k], AB::Expr::one());
+        builder
+            .when_last_row()
+            .assert_eq(current[i], AB::Expr::one());
+        builder
+            .when_last_row()
+            .assert_eq(current[j], AB::Expr::one());
+        builder
+            .when_last_row()
+            .assert_eq(current[k], AB::Expr::one());
     }
 }
 
