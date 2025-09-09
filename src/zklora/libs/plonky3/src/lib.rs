@@ -297,7 +297,7 @@ where
                                                 [self.m * self.n + idx * self.p + column_idx])),
                         );
                     // The first number for the running sum is the multiplication of the
-                    // first element in row row_idx and the first elementin colum column_idx
+                    // first element in row row_idx and the first element in column column_idx
                     } else {
                         builder.when_transition().assert_zero(
                             (current[i] - AB::Expr::from_canonical_usize(row_idx))
