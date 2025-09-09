@@ -149,8 +149,8 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
     /// # Returns
     /// A matrix representing the execution trace, where each row is a step in the computation
     /// and columns correspond to:
-    /// - Columns 0..(m*n)-1: All elements from matrix A
-    /// - Columns (m*n)..(m*n+n*p)-1: All elements from matrix B
+    /// - Columns 0..(m*n): All elements from matrix A
+    /// - Columns (m*n)..(m*n+n*p): All elements from matrix B
     /// - Column trace_width()-4: Row index (i)
     /// - Column trace_width()-3: Column index (j)
     /// - Column trace_width()-2: Current position k in the dot product
