@@ -1,0 +1,20 @@
+[package]
+name = "plonky3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyo3 = { version = "0.24.1", features = ["extension-module"] }
+p3-matrix = "0.2.0"
+rand = "0.8.5"
+p3-field = "0.2.0"
+p3-baby-bear = "0.2.0"
+p3-air = "0.2.0"
+p3-keccak = "0.2.0"
+p3-symmetric = "0.2.0"
+p3-merkle-tree = "0.2.0"
+p3-commit = "0.2.0"
+p3-challenger = "0.2.0"
+p3-circle = "0.2.0"
+p3-uni-stark = "0.2.0"
+p3-fri = "0.2.0"
