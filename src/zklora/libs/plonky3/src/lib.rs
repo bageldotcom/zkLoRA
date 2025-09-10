@@ -60,8 +60,14 @@ pub struct MatrixMultiplicationAIR<F: PrimeField> {
     pub n: usize,
     /// Number of columns in matrix B
     pub p: usize,
+
     pub byte_hash: ByteHash,
     pub field_hash: FieldHash,
+    pub compress: MyCompress,
+    pub val_mmcs: ValMmcs,
+    pub challenge_mmcs: ChallengeMmcs,
+    pub config: MyConfig,
+
     /// Field element type
     _phantom: std::marker::PhantomData<F>,
 }
@@ -98,7 +104,7 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
         // Creates a new instance of the compression function.
         let compress = MyCompress::new(byte_hash);
         // Instantiates the Merkle tree commitment scheme.
-        let val_mmcs = ValMmcs::new(field_hash, compress);
+        let val_mmcs = ValMmcs::new(field_hash, compress.clone());
         // Creates an instance of the challenge Merkle tree commitment scheme.
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
         // Configures the FRI (Fast Reed-Solomon IOP) protocol parameters.
@@ -106,11 +112,11 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
             log_blowup: 1,
             num_queries: 100,
             proof_of_work_bits: 16,
-            mmcs: challenge_mmcs,
+            mmcs: challenge_mmcs.clone(),
         };
         // Instantiates the polynomial commitment scheme with the above parameters.
         let pcs = Pcs {
-            mmcs: val_mmcs,
+            mmcs: val_mmcs.clone(),
             fri_config,
             _phantom: std::marker::PhantomData,
         };
@@ -123,6 +129,10 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
             p,
             byte_hash,
             field_hash,
+            compress,
+            val_mmcs,
+            challenge_mmcs,
+            config,
             _phantom: std::marker::PhantomData,
         }
     }
