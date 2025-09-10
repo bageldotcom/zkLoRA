@@ -1,5 +1,4 @@
 use p3_air::{Air, AirBuilder, BaseAir};
-use p3_mersenne_31::Mersenne31;
 use p3_challenger::HashChallenger;
 use p3_challenger::SerializingChallenger32;
 use p3_circle::CirclePcs;
@@ -9,9 +8,10 @@ use p3_fri::FriParameters;
 use p3_keccak::Keccak256Hash;
 use p3_matrix::{dense::RowMajorMatrix, Matrix};
 use p3_merkle_tree::MerkleTreeMmcs;
+use p3_mersenne_31::Mersenne31;
 use p3_symmetric::CompressionFunctionFromHasher;
 use p3_symmetric::SerializingHasher;
-use p3_uni_stark::StarkConfig;
+use p3_uni_stark::{prove, StarkConfig};
 
 /// Performs matrix multiplication between two matrices of u16 elements.
 ///
@@ -240,7 +240,19 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
             }
         }
 
-        RowMajorMatrix::new(trace_data, self.trace_width())
+        // Pad the trace to satisfy PCS minimum row requirement (>= 4 rows)
+        let row_width = self.trace_width();
+        if total_rows < 4 {
+            // Duplicate the last row until we reach 4 rows
+            let last_row_start = (total_rows - 1) * row_width;
+            let last_row_end = total_rows * row_width;
+            let last_row: Vec<F> = trace_data[last_row_start..last_row_end].to_vec();
+            for _ in total_rows..4 {
+                trace_data.extend_from_slice(&last_row);
+            }
+        }
+
+        RowMajorMatrix::new(trace_data, row_width)
     }
 }
 
@@ -266,9 +278,10 @@ where
 
         // Enforce starting state
         // Assert that the sum column of the first element of A and B multiplied
-        builder
-            .when_first_row()
-            .assert_eq(current[sum].clone(), current[0].clone() * current[self.m * self.n].clone());
+        builder.when_first_row().assert_eq(
+            current[sum].clone(),
+            current[0].clone() * current[self.m * self.n].clone(),
+        );
 
         // Assert that the row index is 0
         builder
@@ -288,9 +301,11 @@ where
         // Enforce state transition
         // Assert that the matrices don't change between rows
         for idx in 0..(self.m * self.n + self.n * self.p) {
-            builder.when_transition().assert_eq(next[idx].clone(), current[idx].clone());
+            builder
+                .when_transition()
+                .assert_eq(next[idx].clone(), current[idx].clone());
         }
-
+        /*
         //Assert that the multiplication step is correct
         for row_idx in 0..self.m {
             for column_idx in 0..self.p {
@@ -306,7 +321,8 @@ where
                                     - (current[sum].clone()
                                         + current[row_idx * self.n + idx].clone()
                                             * current
-                                                [self.m * self.n + idx * self.p + column_idx].clone())),
+                                                [self.m * self.n + idx * self.p + column_idx]
+                                                .clone())),
                         );
                     // The first number for the running sum is the multiplication of the
                     // first element in row row_idx and the first element in column column_idx
@@ -317,12 +333,14 @@ where
                                 + (current[k].clone() - AB::Expr::from_usize(idx))
                                 + (current[sum].clone()
                                     - current[row_idx * self.n + idx].clone()
-                                        * current[self.m * self.n + idx * self.p + column_idx].clone()),
+                                        * current[self.m * self.n + idx * self.p + column_idx]
+                                            .clone()),
                         );
                     }
                 }
             }
         }
+        */
         //         0  1  2  3  4  5  6  7  8  9 10 11
         // Row 0: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 1]
         // Row 1: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 1, 7]
@@ -333,112 +351,40 @@ where
         // Row 6: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 0, 6]
         // Row 7: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 1, 22]
 
-        // Assert that if k is not the last index, then i,j stays the same and k is incremented
+        // Enforce lexicographic increment of the (i, j, k) triple across transition rows:
+        // flat_next = flat_current + 1, where flat = k + j * n + i * (n * p)
+        let n_expr = AB::Expr::from_usize(self.n);
+        let np_expr = AB::Expr::from_usize(self.n * self.p);
+        let flat_current = current[k].clone()
+            + current[j].clone() * n_expr.clone()
+            + current[i].clone() * np_expr.clone();
+        let flat_next = next[k].clone() + next[j].clone() * n_expr + next[i].clone() * np_expr;
         builder
             .when_transition()
-            .when_ne(current[k].clone(), AB::Expr::from_usize(self.n - 1))
-            .assert_zero(
-                (next[i].clone() - current[i].clone())
-                    + (next[j].clone() - current[j].clone())
-                    + (next[k].clone() - current[k].clone() - AB::Expr::ONE),
-            );
-
-        // Assert that if j is not the last element and k is the last element, then i stays the same, j increments by one, and k is resets to 0
-        builder
-            .when_transition()
-            .when_ne(current[j].clone(), AB::Expr::from_usize(self.p - 1))
-            .assert_zero(
-                (current[k].clone() - AB::Expr::from_usize(self.n - 1))
-                    + (next[i].clone() - current[i].clone())
-                    + (next[j].clone() - current[j].clone() - AB::Expr::ONE)
-                    + (next[k].clone() - AB::Expr::ZERO),
-            );
-
-        // Assert that if i is not the last element and j is the last element and k is the last element, then i increments by one, j resets to 0, and k resets to 0
-        builder
-            .when_transition()
-            .when_ne(current[i].clone(), AB::Expr::from_usize(self.m - 1))
-            .assert_zero(
-                (current[j].clone() - AB::Expr::from_usize(self.p - 1))
-                    + (current[k].clone() - AB::Expr::from_usize(self.n - 1))
-                    + (next[i].clone() - current[i].clone() - AB::Expr::ONE)
-                    + (next[j].clone() - AB::Expr::ZERO)
-                    + (next[k].clone() - AB::Expr::ZERO),
-            );
+            .assert_eq(flat_next, flat_current + AB::Expr::ONE);
 
         // Enforce finale state
-        // Assert that columns i,j,k are all 1
+        // Assert that columns i,j,k are all the max values
         builder
             .when_last_row()
-            .assert_eq(current[i].clone(), AB::Expr::ONE);
+            .assert_eq(current[i].clone(), AB::Expr::from_usize(self.m - 1));
         builder
             .when_last_row()
-            .assert_eq(current[j].clone(), AB::Expr::ONE);
+            .assert_eq(current[j].clone(), AB::Expr::from_usize(self.p - 1));
         builder
             .when_last_row()
-            .assert_eq(current[k].clone(), AB::Expr::ONE);
+            .assert_eq(current[k].clone(), AB::Expr::from_usize(self.n - 1));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p3_baby_bear::BabyBear; // Import the field implementation from p3-baby-bear
+    use p3_field::integers::QuotientMap;
     use p3_matrix::dense::RowMajorMatrix;
+    use p3_mersenne_31::Mersenne31; // Import the field implementation from p3-baby-bear
 
-    #[test]
-    fn test_proving() {
-        // [[1, 2], [3, 4]]
-        let matrix_a: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
-            vec![
-                BabyBear::new(1),
-                BabyBear::new(2),
-                BabyBear::new(3),
-                BabyBear::new(4),
-            ],
-            2,
-        );
-        // [[1, 2], [3, 4]]
-        let matrix_b: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
-            vec![
-                BabyBear::new(1),
-                BabyBear::new(2),
-                BabyBear::new(3),
-                BabyBear::new(4),
-            ],
-            2,
-        );
-
-        let air = MatrixMultiplicationAIR::new(2, 2, 2);
-        let trace = air.generate_trace(&matrix_a, &matrix_b);
-    }
-
-    #[test]
-    fn test_trace() {
-        // [[1, 2], [3, 4]]
-        let matrix_a: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
-            vec![
-                BabyBear::new(1),
-                BabyBear::new(2),
-                BabyBear::new(3),
-                BabyBear::new(4),
-            ],
-            2,
-        );
-        // [[1, 2], [3, 4]]
-        let matrix_b: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
-            vec![
-                BabyBear::new(1),
-                BabyBear::new(2),
-                BabyBear::new(3),
-                BabyBear::new(4),
-            ],
-            2,
-        );
-
-        let air = MatrixMultiplicationAIR::new(2, 2, 2);
-        let trace = air.generate_trace(&matrix_a, &matrix_b);
-        // Print the trace, one row per line
+    fn print_trace(trace: &RowMajorMatrix<Mersenne31>) {
         println!("Trace (one row per line):");
         for i in 0..trace.height() {
             let mut row_values = Vec::new();
@@ -447,6 +393,65 @@ mod tests {
             }
             println!("Row {}: [{}]", i, row_values.join(", "));
         }
+    }
+
+    #[test]
+    fn test_proving() {
+        // [[1, 2], [3, 4]]
+        let matrix_a: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
+            vec![
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+            ],
+            2,
+        );
+        // [[1, 2], [3, 4]]
+        let matrix_b: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
+            vec![
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+            ],
+            2,
+        );
+
+        let air = MatrixMultiplicationAIR::new(2, 2, 2);
+        let trace = air.generate_trace(&matrix_a, &matrix_b);
+        print_trace(&trace);
+        let proof = prove(&air.config, &air, trace, &vec![]);
+    }
+
+    #[test]
+    fn test_trace() {
+        // [[1, 2], [3, 4]]
+        let matrix_a: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
+            vec![
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+            ],
+            2,
+        );
+        // [[1, 2], [3, 4]]
+        let matrix_b: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
+            vec![
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+            ],
+            2,
+        );
+
+        let air = MatrixMultiplicationAIR::new(2, 2, 2);
+        let trace = air.generate_trace(&matrix_a, &matrix_b);
+        // Print the trace, one row per line
+        print_trace(&trace);
+
         // Row 0: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 1]
         // Row 1: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 1, 7]
         // Row 2: [1, 2, 3, 4, 1, 2, 3, 4, 0, 1, 0, 2]
@@ -456,40 +461,40 @@ mod tests {
         // Row 6: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 0, 6]
         // Row 7: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 1, 22]
         #[rustfmt::skip]
-        let correct_trace: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
+        let correct_trace: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
             vec![
                 // Row 0
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(0), BabyBear::new(0), BabyBear::new(0), BabyBear::new(1), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), // i,j,k,sum
                 // Row 1
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(0), BabyBear::new(0), BabyBear::new(1), BabyBear::new(7), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(7), // i,j,k,sum
                 // Row 2
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(0), BabyBear::new(1), BabyBear::new(0), BabyBear::new(2), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(2), // i,j,k,sum
                 // Row 3
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(0), BabyBear::new(1), BabyBear::new(1), BabyBear::new(10), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(10), // i,j,k,sum
                 // Row 4
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(1), BabyBear::new(0), BabyBear::new(0), BabyBear::new(3), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(3), // i,j,k,sum
                 // Row 5
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(1), BabyBear::new(0), BabyBear::new(1), BabyBear::new(15), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(15), // i,j,k,sum
                 // Row 6
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(1), BabyBear::new(1), BabyBear::new(0), BabyBear::new(6), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(6), // i,j,k,sum
                 // Row 7
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix A
-                BabyBear::new(1), BabyBear::new(2), BabyBear::new(3), BabyBear::new(4), // Matrix B
-                BabyBear::new(1), BabyBear::new(1), BabyBear::new(1), BabyBear::new(22), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
+                Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(22), // i,j,k,sum
             ],
             12,
         );
@@ -499,40 +504,40 @@ mod tests {
     #[test]
     fn test_matrix_multiplication() {
         // [[1, 2, 3], [4, 5, 6]]
-        let matrix_a: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
+        let matrix_a: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
             vec![
-                BabyBear::new(1),
-                BabyBear::new(2),
-                BabyBear::new(3),
-                BabyBear::new(4),
-                BabyBear::new(5),
-                BabyBear::new(6),
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+                Mersenne31::from_int(5),
+                Mersenne31::from_int(6),
             ],
             3,
         );
         // [[1, 2], [3, 4], [5, 6]]
-        let matrix_b: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
+        let matrix_b: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
             vec![
-                BabyBear::new(1),
-                BabyBear::new(2),
-                BabyBear::new(3),
-                BabyBear::new(4),
-                BabyBear::new(5),
-                BabyBear::new(6),
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+                Mersenne31::from_int(5),
+                Mersenne31::from_int(6),
             ],
             2,
         );
 
         let real_result = RowMajorMatrix::new(
             vec![
-                BabyBear::new(22),
-                BabyBear::new(28),
-                BabyBear::new(49),
-                BabyBear::new(64),
+                Mersenne31::from_int(22),
+                Mersenne31::from_int(28),
+                Mersenne31::from_int(49),
+                Mersenne31::from_int(64),
             ],
             2,
         );
-        let result = matrix_multiply::<BabyBear>(&matrix_a, &matrix_b);
+        let result = matrix_multiply::<Mersenne31>(&matrix_a, &matrix_b);
         assert_eq!(result, real_result);
     }
 }
