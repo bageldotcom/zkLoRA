@@ -1,16 +1,16 @@
 use p3_air::{Air, AirBuilder, BaseAir};
-use p3_baby_bear::BabyBear;
+use p3_mersenne_31::Mersenne31;
 use p3_challenger::HashChallenger;
 use p3_challenger::SerializingChallenger32;
 use p3_circle::CirclePcs;
 use p3_commit::ExtensionMmcs;
-use p3_field::{extension::BinomialExtensionField, AbstractField, PrimeField};
-use p3_fri::FriConfig;
+use p3_field::{extension::BinomialExtensionField, PrimeCharacteristicRing, PrimeField};
+use p3_fri::FriParameters;
 use p3_keccak::Keccak256Hash;
 use p3_matrix::{dense::RowMajorMatrix, Matrix};
-use p3_merkle_tree::FieldMerkleTreeMmcs;
+use p3_merkle_tree::MerkleTreeMmcs;
 use p3_symmetric::CompressionFunctionFromHasher;
-use p3_symmetric::SerializingHasher32;
+use p3_symmetric::SerializingHasher;
 use p3_uni_stark::StarkConfig;
 
 /// Performs matrix multiplication between two matrices of u16 elements.
@@ -34,13 +34,13 @@ pub fn matrix_multiply<F: PrimeField>(
         "Matrix dimensions must be compatible for multiplication"
     );
 
-    let mut result = vec![F::zero(); a.height() * b.width()];
+    let mut result = vec![F::ZERO; a.height() * b.width()];
 
     for i in 0..a.height() {
         for j in 0..b.width() {
-            let mut sum = F::zero();
+            let mut sum = F::ZERO;
             for k in 0..a.width() {
-                sum += a.get(i, k) * b.get(k, j);
+                sum += a.get(i, k).unwrap() * b.get(k, j).unwrap();
             }
             result[i * b.width() + j] = sum;
         }
@@ -73,7 +73,7 @@ pub struct MatrixMultiplicationAIR<F: PrimeField> {
 }
 
 // Field
-type Val = BabyBear;
+type Val = Mersenne31;
 
 // This creates a cubic extension field over Val using a binomial basis. It's used for generating challenges in the proof system.
 // The reason why we want to extend our field for Challenges, is because the original Field size is too small to be brute-forced to solve the challenge.
@@ -81,11 +81,11 @@ type Challenge = BinomialExtensionField<Val, 3>;
 // Your choice of Hash Function
 type ByteHash = Keccak256Hash;
 // A serializer for Hash function, so that it can take Fields as inputs
-type FieldHash = SerializingHasher32<ByteHash>;
+type FieldHash = SerializingHasher<ByteHash>;
 // Defines a compression function type using ByteHash, with 2 input blocks and 32-byte output.
-type MyCompress = CompressionFunctionFromHasher<u8, ByteHash, 2, 32>;
+type MyCompress = CompressionFunctionFromHasher<ByteHash, 2, 32>;
 // Defines a Merkle tree commitment scheme for field elements with 32 levels.
-type ValMmcs = FieldMerkleTreeMmcs<Val, u8, FieldHash, MyCompress, 32>;
+type ValMmcs = MerkleTreeMmcs<Val, u8, FieldHash, MyCompress, 32>;
 // Defines an extension of the Merkle tree commitment scheme for the challenge field.
 type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
 // Defines the challenger type for generating random challenges.
@@ -108,20 +108,22 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
         // Creates an instance of the challenge Merkle tree commitment scheme.
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
         // Configures the FRI (Fast Reed-Solomon IOP) protocol parameters.
-        let fri_config = FriConfig {
+        let fri_config = FriParameters {
             log_blowup: 1,
             num_queries: 100,
             proof_of_work_bits: 16,
             mmcs: challenge_mmcs.clone(),
+            log_final_poly_len: 1,
         };
         // Instantiates the polynomial commitment scheme with the above parameters.
         let pcs = Pcs {
             mmcs: val_mmcs.clone(),
-            fri_config,
+            fri_params: fri_config,
             _phantom: std::marker::PhantomData,
         };
+        let challenger = Challenger::from_hasher(vec![], byte_hash);
         // Creates the STARK configuration instance.
-        let config = MyConfig::new(pcs);
+        let config = MyConfig::new(pcs, challenger);
 
         Self {
             m,
@@ -207,30 +209,30 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
         // Generate the step-by-step trace
         for i in 0..self.m {
             for j in 0..self.p {
-                let mut running_sum = F::zero();
+                let mut running_sum = F::ZERO;
 
                 for k in 0..self.n {
                     // First, add all elements from matrix A
                     for a_row in 0..self.m {
                         for a_col in 0..self.n {
-                            trace_data.push(a.get(a_row, a_col));
+                            trace_data.push(a.get(a_row, a_col).unwrap());
                         }
                     }
 
                     // Then, add all elements from matrix B
                     for b_row in 0..self.n {
                         for b_col in 0..self.p {
-                            trace_data.push(b.get(b_row, b_col));
+                            trace_data.push(b.get(b_row, b_col).unwrap());
                         }
                     }
 
                     // Add indices i, j, k
-                    trace_data.push(F::from_canonical_u64(i as u64));
-                    trace_data.push(F::from_canonical_u64(j as u64));
-                    trace_data.push(F::from_canonical_u64(k as u64));
+                    trace_data.push(F::from_u64(i as u64));
+                    trace_data.push(F::from_u64(j as u64));
+                    trace_data.push(F::from_u64(k as u64));
 
                     // Update running sum
-                    running_sum += a.get(i, k) * b.get(k, j);
+                    running_sum += a.get(i, k).unwrap() * b.get(k, j).unwrap();
 
                     // Add the running sum
                     trace_data.push(running_sum);
@@ -254,8 +256,8 @@ where
 {
     fn eval(&self, builder: &mut AB) {
         let main = builder.main();
-        let current = main.row_slice(0);
-        let next = main.row_slice(1);
+        let current = main.row_slice(0).unwrap();
+        let next = main.row_slice(1).unwrap();
 
         let i = self.trace_width() - 4;
         let j = self.trace_width() - 3;
@@ -266,27 +268,27 @@ where
         // Assert that the sum column of the first element of A and B multiplied
         builder
             .when_first_row()
-            .assert_eq(current[sum], current[0] * current[self.m * self.n]);
+            .assert_eq(current[sum].clone(), current[0].clone() * current[self.m * self.n].clone());
 
         // Assert that the row index is 0
         builder
             .when_first_row()
-            .assert_eq(current[i], AB::Expr::zero());
+            .assert_eq(current[i].clone(), AB::Expr::ZERO);
 
         // Assert that the column index is 0
         builder
             .when_first_row()
-            .assert_eq(current[j], AB::Expr::zero());
+            .assert_eq(current[j].clone(), AB::Expr::ZERO);
 
         // Assert that the current position is 0
         builder
             .when_first_row()
-            .assert_eq(current[k], AB::Expr::zero());
+            .assert_eq(current[k].clone(), AB::Expr::ZERO);
 
         // Enforce state transition
         // Assert that the matrices don't change between rows
         for idx in 0..(self.m * self.n + self.n * self.p) {
-            builder.when_transition().assert_eq(next[idx], current[idx]);
+            builder.when_transition().assert_eq(next[idx].clone(), current[idx].clone());
         }
 
         //Assert that the multiplication step is correct
@@ -297,25 +299,25 @@ where
                     // of the row of matrix A and the column of matrix B
                     if idx != 0 {
                         builder.when_transition().assert_zero(
-                            (current[i] - AB::Expr::from_canonical_usize(row_idx))
-                                + (current[j] - AB::Expr::from_canonical_usize(column_idx))
-                                + (current[k] - AB::Expr::from_canonical_usize(idx))
-                                + (next[sum]
-                                    - (current[sum]
-                                        + current[row_idx * self.n + idx]
+                            (current[i].clone() - AB::Expr::from_usize(row_idx))
+                                + (current[j].clone() - AB::Expr::from_usize(column_idx))
+                                + (current[k].clone() - AB::Expr::from_usize(idx))
+                                + (next[sum].clone()
+                                    - (current[sum].clone()
+                                        + current[row_idx * self.n + idx].clone()
                                             * current
-                                                [self.m * self.n + idx * self.p + column_idx])),
+                                                [self.m * self.n + idx * self.p + column_idx].clone())),
                         );
                     // The first number for the running sum is the multiplication of the
                     // first element in row row_idx and the first element in column column_idx
                     } else {
                         builder.when_transition().assert_zero(
-                            (current[i] - AB::Expr::from_canonical_usize(row_idx))
-                                + (current[j] - AB::Expr::from_canonical_usize(column_idx))
-                                + (current[k] - AB::Expr::from_canonical_usize(idx))
-                                + (current[sum]
-                                    - current[row_idx * self.n + idx]
-                                        * current[self.m * self.n + idx * self.p + column_idx]),
+                            (current[i].clone() - AB::Expr::from_usize(row_idx))
+                                + (current[j].clone() - AB::Expr::from_usize(column_idx))
+                                + (current[k].clone() - AB::Expr::from_usize(idx))
+                                + (current[sum].clone()
+                                    - current[row_idx * self.n + idx].clone()
+                                        * current[self.m * self.n + idx * self.p + column_idx].clone()),
                         );
                     }
                 }
@@ -334,47 +336,47 @@ where
         // Assert that if k is not the last index, then i,j stays the same and k is incremented
         builder
             .when_transition()
-            .when_ne(current[k], AB::Expr::from_canonical_usize(self.n - 1))
+            .when_ne(current[k].clone(), AB::Expr::from_usize(self.n - 1))
             .assert_zero(
-                (next[i] - current[i])
-                    + (next[j] - current[j])
-                    + (next[k] - current[k] - AB::Expr::one()),
+                (next[i].clone() - current[i].clone())
+                    + (next[j].clone() - current[j].clone())
+                    + (next[k].clone() - current[k].clone() - AB::Expr::ONE),
             );
 
         // Assert that if j is not the last element and k is the last element, then i stays the same, j increments by one, and k is resets to 0
         builder
             .when_transition()
-            .when_ne(current[j], AB::Expr::from_canonical_usize(self.p - 1))
+            .when_ne(current[j].clone(), AB::Expr::from_usize(self.p - 1))
             .assert_zero(
-                (current[k] - AB::Expr::from_canonical_usize(self.n - 1))
-                    + (next[i] - current[i])
-                    + (next[j] - current[j] - AB::Expr::one())
-                    + (next[k] - AB::Expr::zero()),
+                (current[k].clone() - AB::Expr::from_usize(self.n - 1))
+                    + (next[i].clone() - current[i].clone())
+                    + (next[j].clone() - current[j].clone() - AB::Expr::ONE)
+                    + (next[k].clone() - AB::Expr::ZERO),
             );
 
         // Assert that if i is not the last element and j is the last element and k is the last element, then i increments by one, j resets to 0, and k resets to 0
         builder
             .when_transition()
-            .when_ne(current[i], AB::Expr::from_canonical_usize(self.m - 1))
+            .when_ne(current[i].clone(), AB::Expr::from_usize(self.m - 1))
             .assert_zero(
-                (current[j] - AB::Expr::from_canonical_usize(self.p - 1))
-                    + (current[k] - AB::Expr::from_canonical_usize(self.n - 1))
-                    + (next[i] - current[i] - AB::Expr::one())
-                    + (next[j] - AB::Expr::zero())
-                    + (next[k] - AB::Expr::zero()),
+                (current[j].clone() - AB::Expr::from_usize(self.p - 1))
+                    + (current[k].clone() - AB::Expr::from_usize(self.n - 1))
+                    + (next[i].clone() - current[i].clone() - AB::Expr::ONE)
+                    + (next[j].clone() - AB::Expr::ZERO)
+                    + (next[k].clone() - AB::Expr::ZERO),
             );
 
         // Enforce finale state
         // Assert that columns i,j,k are all 1
         builder
             .when_last_row()
-            .assert_eq(current[i], AB::Expr::one());
+            .assert_eq(current[i].clone(), AB::Expr::ONE);
         builder
             .when_last_row()
-            .assert_eq(current[j], AB::Expr::one());
+            .assert_eq(current[j].clone(), AB::Expr::ONE);
         builder
             .when_last_row()
-            .assert_eq(current[k], AB::Expr::one());
+            .assert_eq(current[k].clone(), AB::Expr::ONE);
     }
 }
 
@@ -383,6 +385,33 @@ mod tests {
     use super::*;
     use p3_baby_bear::BabyBear; // Import the field implementation from p3-baby-bear
     use p3_matrix::dense::RowMajorMatrix;
+
+    #[test]
+    fn test_proving() {
+        // [[1, 2], [3, 4]]
+        let matrix_a: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+            ],
+            2,
+        );
+        // [[1, 2], [3, 4]]
+        let matrix_b: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+            ],
+            2,
+        );
+
+        let air = MatrixMultiplicationAIR::new(2, 2, 2);
+        let trace = air.generate_trace(&matrix_a, &matrix_b);
+    }
 
     #[test]
     fn test_trace() {
@@ -414,7 +443,7 @@ mod tests {
         for i in 0..trace.height() {
             let mut row_values = Vec::new();
             for j in 0..trace.width() {
-                row_values.push(format!("{}", trace.get(i, j)));
+                row_values.push(format!("{}", trace.get(i, j).unwrap()));
             }
             println!("Row {}: [{}]", i, row_values.join(", "));
         }
