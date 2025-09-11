@@ -305,14 +305,15 @@ where
                 .when_transition()
                 .assert_eq(next[idx].clone(), current[idx].clone());
         }
-        /*
+
         //Assert that the multiplication step is correct
         for row_idx in 0..self.m {
             for column_idx in 0..self.p {
                 for idx in 0..self.n {
                     // The running sum is applied after the first index in the inner product
                     // of the row of matrix A and the column of matrix B
-                    if idx != 0 {
+                    /*if idx != 0 {
+
                         builder.when_transition().assert_zero(
                             (current[i].clone() - AB::Expr::from_usize(row_idx))
                                 + (current[j].clone() - AB::Expr::from_usize(column_idx))
@@ -324,23 +325,22 @@ where
                                                 [self.m * self.n + idx * self.p + column_idx]
                                                 .clone())),
                         );
-                    // The first number for the running sum is the multiplication of the
-                    // first element in row row_idx and the first element in column column_idx
+                        // The first number for the running sum is the multiplication of the
+                        // first element in row row_idx and the first element in column column_idx
                     } else {
-                        builder.when_transition().assert_zero(
-                            (current[i].clone() - AB::Expr::from_usize(row_idx))
-                                + (current[j].clone() - AB::Expr::from_usize(column_idx))
-                                + (current[k].clone() - AB::Expr::from_usize(idx))
-                                + (current[sum].clone()
+                        builder
+                            .when(current[k].clone() - AB::Expr::ZERO)
+                            .assert_zero(
+                                current[sum].clone()
                                     - current[row_idx * self.n + idx].clone()
                                         * current[self.m * self.n + idx * self.p + column_idx]
-                                            .clone()),
-                        );
-                    }
+                                            .clone(),
+                            );
+                    }*/
                 }
             }
         }
-        */
+
         //         0  1  2  3  4  5  6  7  8  9 10 11
         // Row 0: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 1]
         // Row 1: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 1, 7]
