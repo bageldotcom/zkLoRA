@@ -49,6 +49,17 @@ pub fn matrix_multiply<F: PrimeField>(
     RowMajorMatrix::new(result, b.width())
 }
 
+pub fn vector_matrix_multiply<F: PrimeField>(a: &Vec<F>, b: &RowMajorMatrix<F>) -> Vec<F> {
+    assert_eq!(a.len(), b.height(), "Vector length must match matrix height");
+    let mut result = vec![F::ZERO; b.width()];
+    for i in 0..b.width() {
+        for j in 0..b.height() {
+            result[i] += a[j] * b.get(j, i).unwrap();
+        }
+    }
+    result
+}
+
 /// AIR (Algebraic Intermediate Representation) for matrix multiplication.
 /// This struct represents the configuration and constraints for proving matrix multiplication
 /// using an algebraic execution trace. It tracks the dimensions of the input matrices
@@ -499,6 +510,24 @@ mod tests {
             12,
         );
         assert_eq!(trace, correct_trace);
+    }
+
+    #[test]
+    fn test_vector_matrix_multiplication() {
+        let vector = vec![Mersenne31::from_int(1), Mersenne31::from_int(2)];
+        let matrix = RowMajorMatrix::new(
+            vec![
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+            ],
+            2,
+        );
+
+        let real_result = vec![Mersenne31::from_int(7), Mersenne31::from_int(10)];
+        let result = vector_matrix_multiply(&vector, &matrix);
+        assert_eq!(result, real_result);
     }
 
     #[test]
