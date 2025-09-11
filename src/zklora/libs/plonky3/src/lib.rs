@@ -61,7 +61,11 @@ pub fn matrix_multiply<F: PrimeField>(
 /// # Panics
 /// Panics if the length of the vector does not match the height of the matrix.
 pub fn vector_matrix_multiply<F: PrimeField>(a: &Vec<F>, b: &RowMajorMatrix<F>) -> Vec<F> {
-    assert_eq!(a.len(), b.height(), "Vector length must match matrix height");
+    assert_eq!(
+        a.len(),
+        b.height(),
+        "Vector length must match matrix height"
+    );
     let mut result = vec![F::ZERO; b.width()];
     for i in 0..b.width() {
         for j in 0..b.height() {
@@ -75,13 +79,11 @@ pub fn vector_matrix_multiply<F: PrimeField>(a: &Vec<F>, b: &RowMajorMatrix<F>) 
 /// This struct represents the configuration and constraints for proving matrix multiplication
 /// using an algebraic execution trace. It tracks the dimensions of the input matrices
 /// and provides methods for generating and verifying the computation trace.
-pub struct MatrixMultiplicationAIR<F: PrimeField> {
-    /// Number of rows in matrix A
+pub struct VectorMatrixMultiplicationAIR<F: PrimeField> {
+    /// Length of vector (number of rows in matrix)
     pub m: usize,
-    /// Number of columns in matrix A (and rows in matrix B)
+    /// Number of columns in matrix
     pub n: usize,
-    /// Number of columns in matrix B
-    pub p: usize,
 
     pub byte_hash: ByteHash,
     pub field_hash: FieldHash,
@@ -117,8 +119,8 @@ type Pcs = CirclePcs<Val, ValMmcs, ChallengeMmcs>;
 // Defines the overall STARK configuration type.
 type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
 
-impl<F: PrimeField> MatrixMultiplicationAIR<F> {
-    pub fn new(m: usize, n: usize, p: usize) -> Self {
+impl<F: PrimeField> VectorMatrixMultiplicationAIR<F> {
+    pub fn new(m: usize, n: usize) -> Self {
         // Declaring an empty hash and its serializer.
         let byte_hash = ByteHash {};
         // Declaring Field hash function, it is used to hash field elements in the proof system
@@ -150,7 +152,6 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
         Self {
             m,
             n,
-            p,
             byte_hash,
             field_hash,
             compress,
@@ -164,14 +165,23 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
     /// Returns the number of columns in the execution trace
     ///
     /// The execution trace for matrix multiplication requires columns to store:
-    /// - All elements from matrix A (m * n columns)
-    /// - All elements from matrix B (n * p columns)
-    /// - Three index variables (i, j, k) for tracking the current position in the computation
+    /// - All elements from vector (m columns)
+    /// - All elements from matrix (n * m columns)
+    /// - m + (m * n) columns for the selectors
     /// - One column for the running sum of the current element being computed
     ///
-    /// The total width is calculated as: (m * n) + (n * p) + 3 + 1
+    /// The total width is calculated as: 2 * (m + m * n) + 1
     pub fn trace_width(&self) -> usize {
-        (self.m * self.n) + (self.n * self.p) + 3 + 1
+        2 * (self.m + self.m * self.n) + 1
+    }
+
+    /// Pushes the matrix elements to the trace data with column major order
+    fn push_matrix(&self, trace_data: &mut Vec<F>, a: &RowMajorMatrix<F>) {
+        for i in 0..self.m {
+            for j in 0..self.n {
+                trace_data.push(a.get(j, i).unwrap());
+            }
+        }
     }
 
     /// Generates a computation trace for matrix multiplication
@@ -189,214 +199,87 @@ impl<F: PrimeField> MatrixMultiplicationAIR<F> {
     /// - Column trace_width()-3: Column index (j)
     /// - Column trace_width()-2: Current position k in the dot product
     /// - Column trace_width()-1: Current running sum for element C(i,j)
-    pub fn generate_trace(
-        &self,
-        a: &RowMajorMatrix<F>,
-        b: &RowMajorMatrix<F>,
-    ) -> RowMajorMatrix<F> {
+    pub fn generate_trace(&self, v: &Vec<F>, a: &RowMajorMatrix<F>) -> RowMajorMatrix<F> {
         assert_eq!(
             a.height(),
             self.m,
-            "Matrix A height should match AIR configuration"
+            "Matrix height should match AIR configuration"
         );
         assert_eq!(
             a.width(),
             self.n,
-            "Matrix A width should match AIR configuration"
+            "Matrix width should match AIR configuration"
         );
         assert_eq!(
-            b.height(),
-            self.n,
-            "Matrix B height should match AIR configuration"
-        );
-        assert_eq!(
-            b.width(),
-            self.p,
-            "Matrix B width should match AIR configuration"
+            v.len(),
+            self.m,
+            "Vector length should match AIR configuration"
         );
 
         // Compute total number of steps needed for the trace
-        // For each element C[i,j], we need n steps to compute the dot product
-        let total_rows = self.m * self.p * self.n;
-
-        // Calculate the new trace width:
-        // - Matrix A elements (m*n columns)
-        // - Matrix B elements (n*p columns)
-        // - Indices i, j, k (3 columns)
-        // - Running sum (1 column)
+        // For each element V[i], we need m steps to compute the dot product
+        let total_rows = self.m * self.n;
 
         // Initialize the trace matrix with F elements
         let mut trace_data: Vec<F> = Vec::with_capacity(total_rows * self.trace_width());
 
+        let mut vector_selector: Vec<F> = vec![F::ONE]
+            .into_iter()
+            .chain(std::iter::repeat(F::ZERO).take(self.m - 1))
+            .collect();
+        let mut matrix_selector: Vec<F> = vec![F::ONE]
+            .into_iter()
+            .chain(std::iter::repeat(F::ZERO).take(self.m * self.n - 1))
+            .collect();
+
+        let mut previous_sum = F::ZERO;
+
         // Generate the step-by-step trace
-        for i in 0..self.m {
-            for j in 0..self.p {
-                let mut running_sum = F::ZERO;
+        for _ in 0..total_rows {
+            trace_data.extend_from_slice(v);
+            self.push_matrix(&mut trace_data, a);
+            trace_data.extend_from_slice(&vector_selector);
+            trace_data.extend_from_slice(&matrix_selector);
 
-                for k in 0..self.n {
-                    // First, add all elements from matrix A
-                    for a_row in 0..self.m {
-                        for a_col in 0..self.n {
-                            trace_data.push(a.get(a_row, a_col).unwrap());
-                        }
-                    }
+            // Find the index in vector_selector where the value is F::ONE
+            let vector_index = vector_selector
+                .iter()
+                .position(|&x| x == F::ONE)
+                .expect("vector_selector should contain F::ONE");
 
-                    // Then, add all elements from matrix B
-                    for b_row in 0..self.n {
-                        for b_col in 0..self.p {
-                            trace_data.push(b.get(b_row, b_col).unwrap());
-                        }
-                    }
+            // Get the index in matrix_selector where the value is F::ONE
+            let matrix_index = matrix_selector
+                .iter()
+                .position(|&x| x == F::ONE)
+                .expect("matrix_selector should contain F::ONE");
 
-                    // Add indices i, j, k
-                    trace_data.push(F::from_u64(i as u64));
-                    trace_data.push(F::from_u64(j as u64));
-                    trace_data.push(F::from_u64(k as u64));
+            let running_sum = if vector_index == 1 {
+                trace_data[vector_index] * trace_data[self.m + matrix_index] + previous_sum
+            } else {
+                trace_data[vector_index] * trace_data[self.m + matrix_index]
+            };
+            trace_data.push(running_sum);
+            previous_sum = running_sum.clone();
 
-                    // Update running sum
-                    running_sum += a.get(i, k).unwrap() * b.get(k, j).unwrap();
-
-                    // Add the running sum
-                    trace_data.push(running_sum);
-                }
-            }
+            vector_selector.rotate_right(1);
+            matrix_selector.rotate_right(1);
         }
 
-        // Pad the trace to satisfy PCS minimum row requirement (>= 4 rows)
-        let row_width = self.trace_width();
-        if total_rows < 4 {
-            // Duplicate the last row until we reach 4 rows
-            let last_row_start = (total_rows - 1) * row_width;
-            let last_row_end = total_rows * row_width;
-            let last_row: Vec<F> = trace_data[last_row_start..last_row_end].to_vec();
-            for _ in total_rows..4 {
-                trace_data.extend_from_slice(&last_row);
-            }
-        }
-
-        RowMajorMatrix::new(trace_data, row_width)
+        RowMajorMatrix::new(trace_data, self.trace_width())
     }
 }
 
-impl<F: PrimeField> BaseAir<F> for MatrixMultiplicationAIR<F> {
+impl<F: PrimeField> BaseAir<F> for VectorMatrixMultiplicationAIR<F> {
     fn width(&self) -> usize {
         self.trace_width()
     }
 }
 
-impl<AB: AirBuilder> Air<AB> for MatrixMultiplicationAIR<AB::F>
+impl<AB: AirBuilder> Air<AB> for VectorMatrixMultiplicationAIR<AB::F>
 where
     AB::F: PrimeField,
 {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let current = main.row_slice(0).unwrap();
-        let next = main.row_slice(1).unwrap();
-
-        let i = self.trace_width() - 4;
-        let j = self.trace_width() - 3;
-        let k = self.trace_width() - 2;
-        let sum = self.trace_width() - 1;
-
-        // Enforce starting state
-        // Assert that the sum column of the first element of A and B multiplied
-        builder.when_first_row().assert_eq(
-            current[sum].clone(),
-            current[0].clone() * current[self.m * self.n].clone(),
-        );
-
-        // Assert that the row index is 0
-        builder
-            .when_first_row()
-            .assert_eq(current[i].clone(), AB::Expr::ZERO);
-
-        // Assert that the column index is 0
-        builder
-            .when_first_row()
-            .assert_eq(current[j].clone(), AB::Expr::ZERO);
-
-        // Assert that the current position is 0
-        builder
-            .when_first_row()
-            .assert_eq(current[k].clone(), AB::Expr::ZERO);
-
-        // Enforce state transition
-        // Assert that the matrices don't change between rows
-        for idx in 0..(self.m * self.n + self.n * self.p) {
-            builder
-                .when_transition()
-                .assert_eq(next[idx].clone(), current[idx].clone());
-        }
-
-        //Assert that the multiplication step is correct
-        for row_idx in 0..self.m {
-            for column_idx in 0..self.p {
-                for idx in 0..self.n {
-                    // The running sum is applied after the first index in the inner product
-                    // of the row of matrix A and the column of matrix B
-                    /*if idx != 0 {
-
-                        builder.when_transition().assert_zero(
-                            (current[i].clone() - AB::Expr::from_usize(row_idx))
-                                + (current[j].clone() - AB::Expr::from_usize(column_idx))
-                                + (current[k].clone() - AB::Expr::from_usize(idx))
-                                + (next[sum].clone()
-                                    - (current[sum].clone()
-                                        + current[row_idx * self.n + idx].clone()
-                                            * current
-                                                [self.m * self.n + idx * self.p + column_idx]
-                                                .clone())),
-                        );
-                        // The first number for the running sum is the multiplication of the
-                        // first element in row row_idx and the first element in column column_idx
-                    } else {
-                        builder
-                            .when(current[k].clone() - AB::Expr::ZERO)
-                            .assert_zero(
-                                current[sum].clone()
-                                    - current[row_idx * self.n + idx].clone()
-                                        * current[self.m * self.n + idx * self.p + column_idx]
-                                            .clone(),
-                            );
-                    }*/
-                }
-            }
-        }
-
-        //         0  1  2  3  4  5  6  7  8  9 10 11
-        // Row 0: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 1]
-        // Row 1: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 1, 7]
-        // Row 2: [1, 2, 3, 4, 1, 2, 3, 4, 0, 1, 0, 2]
-        // Row 3: [1, 2, 3, 4, 1, 2, 3, 4, 0, 1, 1, 10]
-        // Row 4: [1, 2, 3, 4, 1, 2, 3, 4, 1, 0, 0, 3]
-        // Row 5: [1, 2, 3, 4, 1, 2, 3, 4, 1, 0, 1, 15]
-        // Row 6: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 0, 6]
-        // Row 7: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 1, 22]
-
-        // Enforce lexicographic increment of the (i, j, k) triple across transition rows:
-        // flat_next = flat_current + 1, where flat = k + j * n + i * (n * p)
-        let n_expr = AB::Expr::from_usize(self.n);
-        let np_expr = AB::Expr::from_usize(self.n * self.p);
-        let flat_current = current[k].clone()
-            + current[j].clone() * n_expr.clone()
-            + current[i].clone() * np_expr.clone();
-        let flat_next = next[k].clone() + next[j].clone() * n_expr + next[i].clone() * np_expr;
-        builder
-            .when_transition()
-            .assert_eq(flat_next, flat_current + AB::Expr::ONE);
-
-        // Enforce finale state
-        // Assert that columns i,j,k are all the max values
-        builder
-            .when_last_row()
-            .assert_eq(current[i].clone(), AB::Expr::from_usize(self.m - 1));
-        builder
-            .when_last_row()
-            .assert_eq(current[j].clone(), AB::Expr::from_usize(self.p - 1));
-        builder
-            .when_last_row()
-            .assert_eq(current[k].clone(), AB::Expr::from_usize(self.n - 1));
-    }
+    fn eval(&self, builder: &mut AB) {}
 }
 
 #[cfg(test)]
@@ -418,48 +301,10 @@ mod tests {
     }
 
     #[test]
-    fn test_proving() {
-        // [[1, 2], [3, 4]]
-        let matrix_a: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
-            vec![
-                Mersenne31::from_int(1),
-                Mersenne31::from_int(2),
-                Mersenne31::from_int(3),
-                Mersenne31::from_int(4),
-            ],
-            2,
-        );
-        // [[1, 2], [3, 4]]
-        let matrix_b: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
-            vec![
-                Mersenne31::from_int(1),
-                Mersenne31::from_int(2),
-                Mersenne31::from_int(3),
-                Mersenne31::from_int(4),
-            ],
-            2,
-        );
-
-        let air = MatrixMultiplicationAIR::new(2, 2, 2);
-        let trace = air.generate_trace(&matrix_a, &matrix_b);
-        print_trace(&trace);
-        let proof = prove(&air.config, &air, trace, &vec![]);
-    }
-
-    #[test]
     fn test_trace() {
+        let vector = vec![Mersenne31::from_int(1), Mersenne31::from_int(2)];
         // [[1, 2], [3, 4]]
-        let matrix_a: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
-            vec![
-                Mersenne31::from_int(1),
-                Mersenne31::from_int(2),
-                Mersenne31::from_int(3),
-                Mersenne31::from_int(4),
-            ],
-            2,
-        );
-        // [[1, 2], [3, 4]]
-        let matrix_b: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
+        let matrix = RowMajorMatrix::new(
             vec![
                 Mersenne31::from_int(1),
                 Mersenne31::from_int(2),
@@ -469,56 +314,25 @@ mod tests {
             2,
         );
 
-        let air = MatrixMultiplicationAIR::new(2, 2, 2);
-        let trace = air.generate_trace(&matrix_a, &matrix_b);
+        let air = VectorMatrixMultiplicationAIR::new(2, 2);
+        let trace = air.generate_trace(&vector, &matrix);
         // Print the trace, one row per line
         print_trace(&trace);
 
-        // Row 0: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 1]
-        // Row 1: [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 1, 7]
-        // Row 2: [1, 2, 3, 4, 1, 2, 3, 4, 0, 1, 0, 2]
-        // Row 3: [1, 2, 3, 4, 1, 2, 3, 4, 0, 1, 1, 10]
-        // Row 4: [1, 2, 3, 4, 1, 2, 3, 4, 1, 0, 0, 3]
-        // Row 5: [1, 2, 3, 4, 1, 2, 3, 4, 1, 0, 1, 15]
-        // Row 6: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 0, 6]
-        // Row 7: [1, 2, 3, 4, 1, 2, 3, 4, 1, 1, 1, 22]
+        // Row 0: [1, 2, 1, 3, 2, 4, 1, 0, 1, 0, 0, 0, 1]
+        // Row 1: [1, 2, 1, 3, 2, 4, 0, 1, 0, 1, 0, 0, 7]
+        // Row 2: [1, 2, 1, 3, 2, 4, 1, 0, 0, 0, 1, 0, 2]
+        // Row 3: [1, 2, 1, 3, 2, 4, 0, 1, 0, 0, 0, 1, 10]
+
         #[rustfmt::skip]
         let correct_trace: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
             vec![
-                // Row 0
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), // i,j,k,sum
-                // Row 1
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(7), // i,j,k,sum
-                // Row 2
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(2), // i,j,k,sum
-                // Row 3
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(10), // i,j,k,sum
-                // Row 4
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(3), // i,j,k,sum
-                // Row 5
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(15), // i,j,k,sum
-                // Row 6
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(6), // i,j,k,sum
-                // Row 7
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix A
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3), Mersenne31::from_int(4), // Matrix B
-                Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(1), Mersenne31::from_int(22), // i,j,k,sum
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1),
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(7),
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(2),
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(10),
             ],
-            12,
+            13,
         );
         assert_eq!(trace, correct_trace);
     }
