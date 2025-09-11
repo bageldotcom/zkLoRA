@@ -290,9 +290,33 @@ where
         let sum = self.trace_width() - 1;
 
         // Enforce starting state
+        // sum equal the first element of the vector times the first element of the matrix
+        builder.when_first_row().assert_eq(
+            current[sum].clone(),
+            current[0].clone() * current[m_sel_init].clone(),
+        );
+
+        // The first element of the vector selector is 1
         builder
             .when_first_row()
-            .assert_eq(current[sum].clone(), current[0].clone() * current[m_sel_init].clone());
+            .assert_one(current[v_sel_init].clone());
+        // The rest of the vector selectors are 0
+        for i in 1..self.m {
+            builder
+                .when_first_row()
+                .assert_zero(current[v_sel_init + i].clone());
+        }
+
+        // The first element of the matrix selector is 1
+        builder
+            .when_first_row()
+            .assert_one(current[m_sel_init].clone());
+        // The rest of the matrix selectors are 0
+        for i in 1..self.m {
+            builder
+                .when_first_row()
+                .assert_zero(current[m_sel_init + i].clone());
+        }
     }
 }
 
