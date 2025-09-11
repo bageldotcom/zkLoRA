@@ -279,7 +279,21 @@ impl<AB: AirBuilder> Air<AB> for VectorMatrixMultiplicationAIR<AB::F>
 where
     AB::F: PrimeField,
 {
-    fn eval(&self, builder: &mut AB) {}
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let current = main.row_slice(0).unwrap();
+        let next = main.row_slice(1).unwrap();
+
+        let v_sel_init = self.n * self.m + self.m;
+        let m_sel_init = self.n * self.m + self.m + self.m;
+        let matrix_init = self.m;
+        let sum = self.trace_width() - 1;
+
+        // Enforce starting state
+        builder
+            .when_first_row()
+            .assert_eq(current[sum].clone(), current[0].clone() * current[m_sel_init].clone());
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +312,26 @@ mod tests {
             }
             println!("Row {}: [{}]", i, row_values.join(", "));
         }
+    }
+
+    #[test]
+    fn test_proving() {
+        let vector = vec![Mersenne31::from_int(1), Mersenne31::from_int(2)];
+        // [[1, 2], [3, 4]]
+        let matrix = RowMajorMatrix::new(
+            vec![
+                Mersenne31::from_int(1),
+                Mersenne31::from_int(2),
+                Mersenne31::from_int(3),
+                Mersenne31::from_int(4),
+            ],
+            2,
+        );
+
+        let air = VectorMatrixMultiplicationAIR::new(2, 2);
+        let trace = air.generate_trace(&vector, &matrix);
+        print_trace(&trace);
+        let proof = prove(&air.config, &air, trace, &vec![]);
     }
 
     #[test]
