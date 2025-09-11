@@ -49,6 +49,17 @@ pub fn matrix_multiply<F: PrimeField>(
     RowMajorMatrix::new(result, b.width())
 }
 
+/// Multiplies a vector by a matrix (vector * matrix).
+///
+/// # Arguments
+/// * `a` - A reference to a vector of field elements (length m)
+/// * `b` - A reference to a matrix of field elements (m x n)
+///
+/// # Returns
+/// A vector of field elements (length n) representing the result of the multiplication.
+///
+/// # Panics
+/// Panics if the length of the vector does not match the height of the matrix.
 pub fn vector_matrix_multiply<F: PrimeField>(a: &Vec<F>, b: &RowMajorMatrix<F>) -> Vec<F> {
     assert_eq!(a.len(), b.height(), "Vector length must match matrix height");
     let mut result = vec![F::ZERO; b.width()];
