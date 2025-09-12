@@ -169,10 +169,11 @@ impl<F: PrimeField> VectorMatrixMultiplicationAIR<F> {
     /// - All elements from matrix (n * m columns)
     /// - m + (m * n) columns for the selectors
     /// - One column for the running sum of the current element being computed
+    /// - One column for the row in the trace that is enabled
     ///
     /// The total width is calculated as: 2 * (m + m * n) + 1
     pub fn trace_width(&self) -> usize {
-        2 * (self.m + self.m * self.n) + 1
+        2 * (self.m + self.m * self.n) + 1 + 1
     }
 
     /// Pushes the matrix elements to the trace data with column major order
@@ -261,11 +262,27 @@ impl<F: PrimeField> VectorMatrixMultiplicationAIR<F> {
             trace_data.push(running_sum);
             previous_sum = running_sum.clone();
 
+            trace_data.push(F::ONE);
+
             vector_selector.rotate_right(1);
             matrix_selector.rotate_right(1);
         }
 
-        RowMajorMatrix::new(trace_data, self.trace_width())
+        // If the trace length is not a power of two, pad it with dummy rows of zeros so that
+        // the total number of rows is the next power of two. The last column (running sum)
+        // is explicitly set to 0 for these padding rows to indicate that they are inactive.
+
+        let width = self.trace_width();
+        let padded_rows = total_rows.next_power_of_two();
+        if padded_rows > total_rows {
+            for _ in 0..(padded_rows - total_rows) {
+                // Push `width` zeros. Since we are inside a PrimeField, F::ZERO is valid.
+                // The last column (running sum) remains 0 as well.
+                trace_data.extend(std::iter::repeat(F::ZERO).take(width));
+            }
+        }
+
+        RowMajorMatrix::new(trace_data, width)
     }
 }
 
@@ -317,6 +334,9 @@ where
                 .when_first_row()
                 .assert_zero(current[m_sel_init + i].clone());
         }
+
+        //Enforce final state
+
     }
 }
 
@@ -340,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_proving() {
-        let vector = vec![Mersenne31::from_int(1), Mersenne31::from_int(2)];
+        let vector = vec![Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3)];
         // [[1, 2], [3, 4]]
         let matrix = RowMajorMatrix::new(
             vec![
@@ -348,11 +368,16 @@ mod tests {
                 Mersenne31::from_int(2),
                 Mersenne31::from_int(3),
                 Mersenne31::from_int(4),
+                Mersenne31::from_int(5),
+                Mersenne31::from_int(6),
+                Mersenne31::from_int(7),
+                Mersenne31::from_int(8),
+                Mersenne31::from_int(9),
             ],
-            2,
+            3,
         );
 
-        let air = VectorMatrixMultiplicationAIR::new(2, 2);
+        let air = VectorMatrixMultiplicationAIR::new(3, 3);
         let trace = air.generate_trace(&vector, &matrix);
         print_trace(&trace);
         let proof = prove(&air.config, &air, trace, &vec![]);
