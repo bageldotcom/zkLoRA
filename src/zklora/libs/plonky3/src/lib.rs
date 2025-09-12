@@ -304,9 +304,15 @@ where
         let v_sel_init = self.n * self.m + self.m;
         let m_sel_init = self.n * self.m + self.m + self.m;
         let matrix_init = self.m;
-        let sum = self.trace_width() - 1;
+        let sum = self.trace_width() - 2;
+        let enabled = self.trace_width() - 1;
 
         // Enforce starting state
+        // the row is enabled
+        builder
+            .when_first_row()
+            .assert_one(current[enabled].clone());
+
         // sum equal the first element of the vector times the first element of the matrix
         builder.when_first_row().assert_eq(
             current[sum].clone(),
@@ -336,7 +342,6 @@ where
         }
 
         //Enforce final state
-
     }
 }
 
@@ -360,7 +365,11 @@ mod tests {
 
     #[test]
     fn test_proving() {
-        let vector = vec![Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(3)];
+        let vector = vec![
+            Mersenne31::from_int(1),
+            Mersenne31::from_int(2),
+            Mersenne31::from_int(3),
+        ];
         // [[1, 2], [3, 4]]
         let matrix = RowMajorMatrix::new(
             vec![
