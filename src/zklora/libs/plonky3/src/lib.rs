@@ -341,7 +341,18 @@ where
                 .assert_zero(current[m_sel_init + i].clone());
         }
 
-        //Enforce final state
+        // Enforce final enabled row is followed by disabled row
+        builder
+            .when_transition()
+            .when(current[enabled].clone())
+            .when(current[sum - 1].clone())
+            .assert_zero(next[enabled].clone());
+
+        // Enforce rows are all 0 in the last column after the last enabled row
+        builder
+            .when_transition()
+            .when(AB::Expr::ONE - current[enabled].clone())
+            .assert_zero(next[enabled].clone());
     }
 }
 
