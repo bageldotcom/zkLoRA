@@ -353,6 +353,27 @@ where
             .when_transition()
             .when(AB::Expr::ONE - current[enabled].clone())
             .assert_zero(next[enabled].clone());
+
+        // Enforce booleanity of the vector selector
+        for i in 0..self.m {
+            builder
+                .when_transition()
+                .when(current[enabled].clone())
+                .assert_bool(current[v_sel_init + i].clone());
+        }
+
+        // Enforce booleanity of the matrix selector
+        for i in 0..self.m {
+            builder
+                .when_transition()
+                .when(current[enabled].clone())
+                .assert_bool(current[m_sel_init + i].clone());
+        }
+
+        // Enforce booleanity of the enabled colum
+        builder
+            .when_transition()
+            .assert_bool(current[enabled].clone());
     }
 }
 
