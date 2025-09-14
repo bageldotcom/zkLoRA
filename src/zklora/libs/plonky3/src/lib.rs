@@ -254,7 +254,7 @@ impl<F: PrimeField> VectorMatrixMultiplicationAIR<F> {
                 .position(|&x| x == F::ONE)
                 .expect("matrix_selector should contain F::ONE");
 
-            let running_sum = if vector_index == 1 {
+            let running_sum = if vector_index > 0 {
                 trace_data[vector_index] * trace_data[self.m + matrix_index] + previous_sum
             } else {
                 trace_data[vector_index] * trace_data[self.m + matrix_index]
@@ -396,13 +396,44 @@ where
             .when(current[enabled].clone())
             .assert_eq(acum, AB::Expr::ONE);
 
-        // Enfocer the vector and matrix do not change between rows
+        // Enforce the vector and matrix do not change between rows
         for i in 0..self.m + self.m * self.n {
             builder
                 .when_transition()
                 .when(current[enabled].clone())
                 .when(next[enabled].clone())
                 .assert_eq(current[i].clone(), next[i].clone());
+        }
+
+        // Enforce the correct vector-matrix multiplication result
+        // If the first element of thevector selector is 1, then
+        // the sum colum does not accumulate from the previous row
+        for i in 0..self.m * self.n {
+            builder
+                .when_transition()
+                .when(current[enabled].clone())
+                .when(current[v_sel_init].clone())
+                .when(current[m_sel_init + i].clone())
+                .assert_eq(
+                    current[sum].clone(),
+                    current[0].clone() * current[matrix_init + i].clone(),
+                );
+        }
+        // If the first element of the vector selector is 0, then
+        // the sum colum accumulates from the previous row
+        for i in 1..self.m {
+            for j in 0..self.m * self.n {
+                builder
+                    .when_transition()
+                    .when(next[enabled].clone())
+                    .when(AB::Expr::ONE - next[v_sel_init].clone())
+                    .when(next[v_sel_init + i].clone())
+                    .when(next[m_sel_init + j].clone())
+                    .assert_eq(
+                        next[sum].clone(),
+                        current[sum].clone() + next[i].clone() * next[matrix_init + j].clone(),
+                    );
+            }
         }
     }
 }
@@ -450,6 +481,7 @@ mod tests {
 
         let air = VectorMatrixMultiplicationAIR::new(3, 3);
         let trace = air.generate_trace(&vector, &matrix);
+        println!("trace width: {:?}", trace.width());
         print_trace(&trace);
         let _proof = prove(&air.config, &air, trace, &vec![]);
     }
@@ -481,13 +513,14 @@ mod tests {
         #[rustfmt::skip]
         let correct_trace: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
             vec![
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1),
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(7),
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(2),
-                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(10),
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(1),
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(7), Mersenne31::from_int(1),
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(2), Mersenne31::from_int(1),
+                Mersenne31::from_int(1), Mersenne31::from_int(2), Mersenne31::from_int(1), Mersenne31::from_int(3), Mersenne31::from_int(2), Mersenne31::from_int(4), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(0), Mersenne31::from_int(1), Mersenne31::from_int(10), Mersenne31::from_int(1),
             ],
-            13,
+            14,
         );
+        assert_eq!(trace.width, correct_trace.width);
         assert_eq!(trace, correct_trace);
     }
 
