@@ -374,6 +374,36 @@ where
         builder
             .when_transition()
             .assert_bool(current[enabled].clone());
+        builder.when_last_row().assert_bool(next[enabled].clone());
+
+        // Enforce the sum of the vector selector is 1
+        let mut acum = AB::Expr::ZERO;
+        for i in 0..self.m {
+            acum += current[v_sel_init + i].clone();
+        }
+        builder
+            .when_transition()
+            .when(current[enabled].clone())
+            .assert_eq(acum, AB::Expr::ONE);
+
+        // Enforce the sum of the matrix selector is 1
+        let mut acum = AB::Expr::ZERO;
+        for i in 0..self.m * self.n {
+            acum += current[m_sel_init + i].clone();
+        }
+        builder
+            .when_transition()
+            .when(current[enabled].clone())
+            .assert_eq(acum, AB::Expr::ONE);
+
+        // Enfocer the vector and matrix do not change between rows
+        for i in 0..self.m + self.m * self.n {
+            builder
+                .when_transition()
+                .when(current[enabled].clone())
+                .when(next[enabled].clone())
+                .assert_eq(current[i].clone(), next[i].clone());
+        }
     }
 }
 
@@ -421,7 +451,7 @@ mod tests {
         let air = VectorMatrixMultiplicationAIR::new(3, 3);
         let trace = air.generate_trace(&vector, &matrix);
         print_trace(&trace);
-        let proof = prove(&air.config, &air, trace, &vec![]);
+        let _proof = prove(&air.config, &air, trace, &vec![]);
     }
 
     #[test]
