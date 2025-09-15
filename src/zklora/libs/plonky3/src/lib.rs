@@ -426,6 +426,51 @@ fn vector_matrix_transform(
     (vector, matrix)
 }
 
+
+/// Generates a zero-knowledge proof for vector-matrix multiplication.
+///
+/// This function creates a cryptographic proof that a given vector `v` was correctly
+/// multiplied by a matrix `a` to produce a result vector, without revealing the actual
+/// computation details. The proof can be verified by anyone without access to the
+/// original inputs.
+///
+/// # Arguments
+///
+/// * `m` - The number of rows in the matrix (and the length of the input vector).
+/// * `n` - The number of columns in the matrix (and the length of the output vector).
+/// * `v` - A reference to the input vector of `u32` values to be multiplied.
+/// * `a` - A reference to the matrix as a vector of vectors of `u32` values.
+///          Must be an `m × n` matrix (m rows, n columns).
+///
+/// # Returns
+///
+/// A `Vec<u8>` containing the serialized zero-knowledge proof. This proof can be
+/// verified using [`vector_matrix_multiplication_verify`] to confirm that the
+/// multiplication was performed correctly without revealing the inputs.
+///
+/// # Panics
+///
+/// This function will panic if:
+/// - The length of vector `v` is not equal to `m`
+/// - The matrix `a` does not have exactly `m` rows
+/// - Any row in matrix `a` does not have exactly `n` columns
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - The proof generation fails
+/// - The proof serialization fails
+///
+/// # Implementation Details
+///
+/// The function:
+/// 1. Transforms the input vector and matrix into the appropriate field representation
+/// 2. Creates a `VectorMatrixMultiplicationAIR` instance for the given dimensions
+/// 3. Generates an execution trace for the computation
+/// 4. Produces a zero-knowledge proof using the STARK proof system
+/// 5. Serializes the proof using bincode for storage/transmission
+///
+/// The proof is generated using the Plonky3 STARK system with Mersenne31 field elements.
 pub fn vector_matrix_multiplication_prove(
     m: usize,
     n: usize,
