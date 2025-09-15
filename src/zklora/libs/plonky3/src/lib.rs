@@ -11,8 +11,7 @@ use p3_merkle_tree::MerkleTreeMmcs;
 use p3_mersenne_31::Mersenne31;
 use p3_symmetric::CompressionFunctionFromHasher;
 use p3_symmetric::SerializingHasher;
-use p3_uni_stark::Proof;
-use p3_uni_stark::{prove, StarkConfig};
+use p3_uni_stark::{prove, verify, StarkConfig};
 
 /// Multiplies a vector by a matrix (vector * matrix).
 ///
@@ -432,12 +431,44 @@ pub fn vector_matrix_multiplication_prove(
     n: usize,
     v: &Vec<u32>,
     a: &Vec<Vec<u32>>,
-) -> Proof<MyConfig> {
+) -> Vec<u8> {
     let (vector, matrix) = vector_matrix_transform(m, n, v, a);
 
     let air = VectorMatrixMultiplicationAIR::new(m, n);
     let trace = air.generate_trace(&vector, &matrix);
-    prove(&air.config, &air, trace, &vec![])
+    let proof = prove(&air.config, &air, trace, &vec![]);
+
+    let config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+    bincode::serde::encode_to_vec(proof, config).expect("Failed to serialize proof")
+}
+
+// Add a public helper that verifies a serialized proof.
+/// Verify a previously generated vector-matrix multiplication proof.
+///
+/// # Arguments
+/// * `m` - Number of rows (length of the vector).
+/// * `n` - Number of columns of the matrix.
+/// * `proof` - A byte vector containing the serialized proof (as produced by
+///             [`vector_matrix_multiplication_prove`]).
+///
+/// # Returns
+/// `true` if the proof is valid, `false` otherwise.
+pub fn vector_matrix_multiplication_verify(m: usize, n: usize, proof_bytes: &Vec<u8>) -> bool {
+    // Deserialize proof bytes
+    let config_bin = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+
+    let (proof_deser, _): (p3_uni_stark::Proof<MyConfig>, usize) =
+        match bincode::serde::decode_from_slice(proof_bytes, config_bin) {
+            Ok(res) => res,
+            Err(_) => return false, // invalid encoding
+        };
+
+    let air = VectorMatrixMultiplicationAIR::new(m, n);
+    verify(&air.config, &air, &proof_deser, &vec![]).is_ok()
 }
 
 #[cfg(test)]
@@ -448,6 +479,15 @@ mod tests {
     use p3_mersenne_31::Mersenne31;
     use p3_uni_stark::{prove, verify, Proof, StarkGenericConfig};
 
+    /// Prints the execution trace of a vector-matrix multiplication as a table.
+    ///
+    /// # Arguments
+    ///
+    /// * `trace` - A reference to a `RowMajorMatrix<Mersenne31>` representing the execution trace.
+    ///
+    /// Each row of the trace corresponds to a step in the computation, and each column contains
+    /// a value relevant to the AIR (Algebraic Intermediate Representation) for the vector-matrix multiplication.
+    /// This function prints each row of the trace, with values separated by commas, for debugging and inspection.
     fn print_trace(trace: &RowMajorMatrix<Mersenne31>) {
         println!("Trace (one row per line):");
         for i in 0..trace.height() {
@@ -481,10 +521,8 @@ mod tests {
         let matrix = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
         let proof = vector_matrix_multiplication_prove(3, 3, &vector, &matrix);
 
-        let air = VectorMatrixMultiplicationAIR::new(3, 3);
-
-        let result = verify(&air.config, &air, &proof, &vec![]);
-        assert!(result.is_ok());
+        let result = vector_matrix_multiplication_verify(3, 3, &proof);
+        assert!(result);
     }
 
     #[test]
