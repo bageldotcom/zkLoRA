@@ -444,6 +444,7 @@ mod tests {
     use p3_field::integers::QuotientMap;
     use p3_matrix::dense::RowMajorMatrix;
     use p3_mersenne_31::Mersenne31; // Import the field implementation from p3-baby-bear
+    use p3_uni_stark::{Proof, StarkGenericConfig, verify};
 
     fn print_trace(trace: &RowMajorMatrix<Mersenne31>) {
         println!("Trace (one row per line):");
@@ -454,6 +455,23 @@ mod tests {
             }
             println!("Row {}: [{}]", i, row_values.join(", "));
         }
+    }
+
+    /// Report the size of the serialized proof.
+    ///
+    /// Serializes the given proof instance using bincode and prints the size in bytes.
+    /// Panics if serialization fails.
+    #[inline]
+    pub fn report_proof_size<SC>(proof: &Proof<SC>)
+    where
+        SC: StarkGenericConfig,
+    {
+        let config = bincode::config::standard()
+            .with_little_endian()
+            .with_fixed_int_encoding();
+        let proof_bytes =
+            bincode::serde::encode_to_vec(proof, config).expect("Failed to serialize proof");
+        println!("Proof size: {} bytes", proof_bytes.len());
     }
 
     #[test]
@@ -483,7 +501,10 @@ mod tests {
         let trace = air.generate_trace(&vector, &matrix);
         println!("trace width: {:?}", trace.width());
         print_trace(&trace);
-        let _proof = prove(&air.config, &air, trace, &vec![]);
+        let proof = prove(&air.config, &air, trace, &vec![]);
+        report_proof_size(&proof);
+        let result = verify(&air.config, &air, &proof, &vec![]);
+        assert!(result.is_ok());
     }
 
     #[test]
