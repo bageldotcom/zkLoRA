@@ -11,7 +11,8 @@ use p3_merkle_tree::MerkleTreeMmcs;
 use p3_mersenne_31::Mersenne31;
 use p3_symmetric::CompressionFunctionFromHasher;
 use p3_symmetric::SerializingHasher;
-use p3_uni_stark::StarkConfig;
+use p3_uni_stark::Proof;
+use p3_uni_stark::{prove, StarkConfig};
 
 /// Multiplies a vector by a matrix (vector * matrix).
 ///
@@ -402,12 +403,49 @@ where
     }
 }
 
+fn vector_matrix_transform(
+    m: usize,
+    n: usize,
+    v: &Vec<u32>,
+    a: &Vec<Vec<u32>>,
+) -> (Vec<Mersenne31>, RowMajorMatrix<Mersenne31>) {
+    assert_eq!(v.len(), m, "Vector length must be m");
+    assert_eq!(a.len(), m, "Matrix must have m rows");
+    // Convert vector v from u32 to Mersenne31
+    let vector: Vec<Mersenne31> = v.iter().map(|&x| Mersenne31::from_u32(x)).collect();
+
+    // Flatten the matrix a (Vec<Vec<u32>>) into a single Vec<Mersenne31> in row-major order
+    let mut matrix_flat: Vec<Mersenne31> = Vec::with_capacity(m * n);
+    for row in a {
+        assert_eq!(row.len(), n, "Each row of the matrix must have n columns");
+        for &val in row {
+            matrix_flat.push(Mersenne31::from_u32(val));
+        }
+    }
+
+    let matrix = RowMajorMatrix::new(matrix_flat, m);
+    (vector, matrix)
+}
+
+pub fn vector_matrix_multiplication_prove(
+    m: usize,
+    n: usize,
+    v: &Vec<u32>,
+    a: &Vec<Vec<u32>>,
+) -> Proof<MyConfig> {
+    let (vector, matrix) = vector_matrix_transform(m, n, v, a);
+
+    let air = VectorMatrixMultiplicationAIR::new(m, n);
+    let trace = air.generate_trace(&vector, &matrix);
+    prove(&air.config, &air, trace, &vec![])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use p3_field::integers::QuotientMap;
     use p3_matrix::dense::RowMajorMatrix;
-    use p3_mersenne_31::Mersenne31; // Import the field implementation from p3-baby-bear
+    use p3_mersenne_31::Mersenne31;
     use p3_uni_stark::{prove, verify, Proof, StarkGenericConfig};
 
     fn print_trace(trace: &RowMajorMatrix<Mersenne31>) {
@@ -425,8 +463,7 @@ mod tests {
     ///
     /// Serializes the given proof instance using bincode and prints the size in bytes.
     /// Panics if serialization fails.
-    #[inline]
-    pub fn report_proof_size<SC>(proof: &Proof<SC>)
+    fn report_proof_size<SC>(proof: &Proof<SC>)
     where
         SC: StarkGenericConfig,
     {
@@ -436,6 +473,18 @@ mod tests {
         let proof_bytes =
             bincode::serde::encode_to_vec(proof, config).expect("Failed to serialize proof");
         println!("Proof size: {} bytes", proof_bytes.len());
+    }
+
+    #[test]
+    fn test_vector_matrix_multiplication_prove() {
+        let vector = vec![1, 2, 3];
+        let matrix = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
+        let proof = vector_matrix_multiplication_prove(3, 3, &vector, &matrix);
+
+        let air = VectorMatrixMultiplicationAIR::new(3, 3);
+
+        let result = verify(&air.config, &air, &proof, &vec![]);
+        assert!(result.is_ok());
     }
 
     #[test]
