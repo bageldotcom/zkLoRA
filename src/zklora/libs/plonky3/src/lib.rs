@@ -406,7 +406,7 @@ where
         }
 
         // Enforce the correct vector-matrix multiplication result
-        // If the first element of thevector selector is 1, then
+        // If the first element of the vector selector is 1, then
         // the sum colum does not accumulate from the previous row
         for i in 0..self.m * self.n {
             builder
@@ -444,7 +444,7 @@ mod tests {
     use p3_field::integers::QuotientMap;
     use p3_matrix::dense::RowMajorMatrix;
     use p3_mersenne_31::Mersenne31; // Import the field implementation from p3-baby-bear
-    use p3_uni_stark::{Proof, StarkGenericConfig, verify};
+    use p3_uni_stark::{verify, Proof, StarkGenericConfig};
 
     fn print_trace(trace: &RowMajorMatrix<Mersenne31>) {
         println!("Trace (one row per line):");
