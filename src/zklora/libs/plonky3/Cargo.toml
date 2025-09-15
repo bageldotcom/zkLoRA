@@ -28,3 +28,4 @@ p3-poseidon = { git = "https://github.com/Plonky3/Plonky3.git" }
 p3-poseidon2 = { git = "https://github.com/Plonky3/Plonky3.git" }
 p3-symmetric = { git = "https://github.com/Plonky3/Plonky3.git" }
 p3-uni-stark = { git = "https://github.com/Plonky3/Plonky3.git" }
+bincode = { version = "2.0.1", features = ["serde"] }
