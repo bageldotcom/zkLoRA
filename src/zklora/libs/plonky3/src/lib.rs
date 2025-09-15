@@ -12,7 +12,10 @@ use p3_mersenne_31::Mersenne31;
 use p3_symmetric::CompressionFunctionFromHasher;
 use p3_symmetric::SerializingHasher;
 use p3_uni_stark::{prove, verify, StarkConfig};
-
+use pyo3::prelude::*;
+use pyo3::types::PyModule;
+use pyo3::wrap_pyfunction;
+use pyo3::Bound;
 /// Multiplies a vector by a matrix (vector * matrix).
 ///
 /// # Arguments
@@ -426,7 +429,6 @@ fn vector_matrix_transform(
     (vector, matrix)
 }
 
-
 /// Generates a zero-knowledge proof for vector-matrix multiplication.
 ///
 /// This function creates a cryptographic proof that a given vector `v` was correctly
@@ -471,13 +473,14 @@ fn vector_matrix_transform(
 /// 5. Serializes the proof using bincode for storage/transmission
 ///
 /// The proof is generated using the Plonky3 STARK system with Mersenne31 field elements.
+#[pyfunction]
 pub fn vector_matrix_multiplication_prove(
     m: usize,
     n: usize,
-    v: &Vec<u32>,
-    a: &Vec<Vec<u32>>,
+    v: Vec<u32>,
+    a: Vec<Vec<u32>>,
 ) -> Vec<u8> {
-    let (vector, matrix) = vector_matrix_transform(m, n, v, a);
+    let (vector, matrix) = vector_matrix_transform(m, n, &v, &a);
 
     let air = VectorMatrixMultiplicationAIR::new(m, n);
     let trace = air.generate_trace(&vector, &matrix);
@@ -500,20 +503,30 @@ pub fn vector_matrix_multiplication_prove(
 ///
 /// # Returns
 /// `true` if the proof is valid, `false` otherwise.
-pub fn vector_matrix_multiplication_verify(m: usize, n: usize, proof_bytes: &Vec<u8>) -> bool {
+#[pyfunction]
+pub fn vector_matrix_multiplication_verify(m: usize, n: usize, proof_bytes: Vec<u8>) -> bool {
     // Deserialize proof bytes
     let config_bin = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
 
     let (proof_deser, _): (p3_uni_stark::Proof<MyConfig>, usize) =
-        match bincode::serde::decode_from_slice(proof_bytes, config_bin) {
+        match bincode::serde::decode_from_slice(&proof_bytes, config_bin) {
             Ok(res) => res,
             Err(_) => return false, // invalid encoding
         };
 
     let air = VectorMatrixMultiplicationAIR::new(m, n);
     verify(&air.config, &air, &proof_deser, &vec![]).is_ok()
+}
+
+/// The Python module definition.
+/// `m` is the module object that will be returned to Python.
+#[pymodule]
+fn plonky3_py(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(vector_matrix_multiplication_prove, m)?)?;
+    m.add_function(wrap_pyfunction!(vector_matrix_multiplication_verify, m)?)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -564,9 +577,9 @@ mod tests {
     fn test_vector_matrix_multiplication_prove() {
         let vector = vec![1, 2, 3];
         let matrix = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
-        let proof = vector_matrix_multiplication_prove(3, 3, &vector, &matrix);
+        let proof = vector_matrix_multiplication_prove(3, 3, vector, matrix);
 
-        let result = vector_matrix_multiplication_verify(3, 3, &proof);
+        let result = vector_matrix_multiplication_verify(3, 3, proof);
         assert!(result);
     }
 
