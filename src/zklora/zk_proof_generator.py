@@ -3,7 +3,7 @@ import glob
 import json
 import time
 import asyncio
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Literal
 
 import numpy as np
 import onnx
@@ -83,12 +83,14 @@ def batch_verify_proofs(
     print(f"Total proofs verified: {len(proof_files)}")
     return total_verify_time, len(proof_files)
 
+ZKBackend = Literal["ezkl", "plonky3"]
 
 async def generate_proofs(
     onnx_dir: str = "lora_onnx_params",
     json_dir: str = "intermediate_activations",
     output_dir: str = "proof_artifacts",
     verbose: bool = False,
+    zk_backend: ZKBackend = "ezkl",
 ) -> Optional[tuple[float, float, float, int, int]]:
     """Asynchronously scans onnx_dir for .onnx files and json_dir for .json files.
     For each matching pair, runs:
@@ -156,85 +158,85 @@ async def generate_proofs(
             proof_file,
         ) = names
 
-        py_args = ezkl.PyRunArgs()
-        py_args.input_visibility = "public"
-        py_args.output_visibility = "public"
-        py_args.param_visibility = "private"
-        py_args.logrows = 20
+        if zk_backend == "ezkl":
+            py_args = ezkl.PyRunArgs()
+            py_args.input_visibility = "public"
+            py_args.output_visibility = "public"
+            py_args.param_visibility = "private"
+            py_args.logrows = 20
 
-        if verbose:
-            print("Generating settings & compiling circuit...")
-        start_time = time.time()
+            if verbose:
+                print("Generating settings & compiling circuit...")
+            start_time = time.time()
 
-        # 1) gen_settings + compile_circuit
-        ezkl.gen_settings(onnx_path, settings_file, py_run_args=py_args)
-        ezkl.compile_circuit(onnx_path, circuit_name, settings_file)
+            # 1) gen_settings + compile_circuit
+            ezkl.gen_settings(onnx_path, settings_file, py_run_args=py_args)
+            ezkl.compile_circuit(onnx_path, circuit_name, settings_file)
 
-        # 2) SRS + setup
-        if not os.path.isfile(srs_file):
-            ezkl.gen_srs(srs_file, py_args.logrows)
-        ezkl.setup(circuit_name, vk_file, pk_file, srs_file)
-        end_time = time.time()
-        if verbose:
-            print(f"Setup for {base_name} took {end_time - start_time:.2f} sec")
-        total_settings_time += end_time - start_time
+            # 2) SRS + setup
+            if not os.path.isfile(srs_file):
+                ezkl.gen_srs(srs_file, py_args.logrows)
+            ezkl.setup(circuit_name, vk_file, pk_file, srs_file)
+            end_time = time.time()
+            if verbose:
+                print(f"Setup for {base_name} took {end_time - start_time:.2f} sec")
+            total_settings_time += end_time - start_time
 
-        # Local check
-        with open(json_path, "r") as f:
-            data = json.load(f)
-        input_array = np.array(data["input_data"], dtype=np.float32)
-        if verbose:
-            print("Input shape from JSON:", input_array.shape)
-        session = onnxruntime.InferenceSession(onnx_path)
-        out = session.run(None, {"input_x": input_array})
-        if verbose:
-            print("Local ONNX output shape:", out[0].shape)
+            # Local check
+            with open(json_path, "r") as f:
+                data = json.load(f)
+            input_array = np.array(data["input_data"], dtype=np.float32)
+            if verbose:
+                print("Input shape from JSON:", input_array.shape)
+            session = onnxruntime.InferenceSession(onnx_path)
+            out = session.run(None, {"input_x": input_array})
+            if verbose:
+                print("Local ONNX output shape:", out[0].shape)
 
-        # 3) gen_witness (async via background thread)
-        if verbose:
-            print("Generating witness (async)...")
-        start_time = time.time()
-        try:
-            # Offload blocking ezkl.gen_witness call to a worker thread so that
-            # the async event loop can continue making progress.
-            await asyncio.to_thread(
-                ezkl.gen_witness,
-                data=json_path,
-                model=circuit_name,
-                output=witness_file,
+            # 3) gen_witness (async)
+            if verbose:
+                print("Generating witness (async)...")
+            start_time = time.time()
+            try:
+                await ezkl.gen_witness(
+                    data=json_path, model=circuit_name, output=witness_file
+                )
+            except RuntimeError as e:
+                print(f"Failed to generate witness: {e}")
+                continue
+
+            if not ezkl.mock(witness_file, circuit_name):
+                print("Mock run failed, skipping.")
+                continue
+
+            end_time = time.time()
+            if verbose:
+                print(f"Witness gen took {end_time - start_time:.2f} sec")
+            total_witness_time += end_time - start_time
+            # 4) prove
+            if verbose:
+                print("Generating proof...")
+            start_time = time.time()
+            prove_ok = ezkl.prove(
+                witness_file, circuit_name, pk_file, proof_file, "single", srs_file
             )
-        except RuntimeError as e:
-            print(f"Failed to generate witness: {e}")
-            continue
+            end_time = time.time()
+            if verbose:
+                print(f"Proof gen took {end_time - start_time:.2f} sec")
+            total_prove_time += end_time - start_time
 
-        if not ezkl.mock(witness_file, circuit_name):
-            print("Mock run failed, skipping.")
-            continue
+            if not prove_ok:
+                print(f"Proof generation failed for {base_name}")
+                continue
 
-        end_time = time.time()
-        if verbose:
-            print(f"Witness gen took {end_time - start_time:.2f} sec")
-        total_witness_time += end_time - start_time
-        # 4) prove
-        if verbose:
-            print("Generating proof...")
-        start_time = time.time()
-        prove_ok = ezkl.prove(
-            witness_file, circuit_name, pk_file, proof_file, "single", srs_file
-        )
-        end_time = time.time()
-        if verbose:
-            print(f"Proof gen took {end_time - start_time:.2f} sec")
-        total_prove_time += end_time - start_time
-
-        if not prove_ok:
-            print(f"Proof generation failed for {base_name}")
-            continue
-
-        if verbose:
-            print(f"Done with {base_name}.\n")
-        os.remove(pk_file)
-        count_onnx_files += 1
+            if verbose:
+                print(f"Done with {base_name}.\n")
+            os.remove(pk_file)
+            count_onnx_files += 1
+        elif zk_backend == "plonky3":
+            pass
+        else:
+            raise ValueError(f"Invalid ZK backend: {zk_backend}")
 
     return (
         total_settings_time,
