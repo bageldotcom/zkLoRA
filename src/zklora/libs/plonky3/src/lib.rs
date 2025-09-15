@@ -11,43 +11,7 @@ use p3_merkle_tree::MerkleTreeMmcs;
 use p3_mersenne_31::Mersenne31;
 use p3_symmetric::CompressionFunctionFromHasher;
 use p3_symmetric::SerializingHasher;
-use p3_uni_stark::{prove, StarkConfig};
-
-/// Performs matrix multiplication between two matrices of u16 elements.
-///
-/// # Arguments
-/// * `a` - First matrix (m x n)
-/// * `b` - Second matrix (n x p)
-///
-/// # Returns
-/// A new matrix (m x p) containing the result of the multiplication
-///
-/// # Panics
-/// Panics if the number of columns in `a` does not match the number of rows in `b`
-pub fn matrix_multiply<F: PrimeField>(
-    a: &RowMajorMatrix<F>,
-    b: &RowMajorMatrix<F>,
-) -> RowMajorMatrix<F> {
-    assert_eq!(
-        a.width(),
-        b.height(),
-        "Matrix dimensions must be compatible for multiplication"
-    );
-
-    let mut result = vec![F::ZERO; a.height() * b.width()];
-
-    for i in 0..a.height() {
-        for j in 0..b.width() {
-            let mut sum = F::ZERO;
-            for k in 0..a.width() {
-                sum += a.get(i, k).unwrap() * b.get(k, j).unwrap();
-            }
-            result[i * b.width() + j] = sum;
-        }
-    }
-
-    RowMajorMatrix::new(result, b.width())
-}
+use p3_uni_stark::StarkConfig;
 
 /// Multiplies a vector by a matrix (vector * matrix).
 ///
@@ -75,8 +39,8 @@ pub fn vector_matrix_multiply<F: PrimeField>(a: &Vec<F>, b: &RowMajorMatrix<F>) 
     result
 }
 
-/// AIR (Algebraic Intermediate Representation) for matrix multiplication.
-/// This struct represents the configuration and constraints for proving matrix multiplication
+/// AIR (Algebraic Intermediate Representation) for vector-matrix multiplication.
+/// This struct represents the configuration and constraints for proving vector-matrix multiplication
 /// using an algebraic execution trace. It tracks the dimensions of the input matrices
 /// and provides methods for generating and verifying the computation trace.
 pub struct VectorMatrixMultiplicationAIR<F: PrimeField> {
@@ -185,21 +149,21 @@ impl<F: PrimeField> VectorMatrixMultiplicationAIR<F> {
         }
     }
 
-    /// Generates a computation trace for matrix multiplication
+    /// Generates a computation trace for vector-matrix multiplication
     ///
     /// # Arguments
-    /// * `a` - First matrix (m x n) with field elements
-    /// * `b` - Second matrix (n x p) with field elements
+    /// * `v` - Input vector (length m) with field elements
+    /// * `a` - Matrix (m x n) with field elements
     ///
     /// # Returns
     /// A matrix representing the execution trace, where each row is a step in the computation
     /// and columns correspond to:
-    /// - Columns 0..(m*n): All elements from matrix A
-    /// - Columns (m*n)..(m*n+n*p): All elements from matrix B
-    /// - Column trace_width()-4: Row index (i)
-    /// - Column trace_width()-3: Column index (j)
-    /// - Column trace_width()-2: Current position k in the dot product
-    /// - Column trace_width()-1: Current running sum for element C(i,j)
+    /// - Columns 0..m: All elements from vector v
+    /// - Columns m..(m+m*n): All elements from matrix a (in column-major order)
+    /// - Columns (m+m*n)..(m+m*n+m): Vector selector (one-hot encoding for vector elements)
+    /// - Columns (m+m*n+m)..(m+m*n+m+m*n): Matrix selector (one-hot encoding for matrix elements)
+    /// - Column trace_width()-2: Running sum for the current dot product computation
+    /// - Column trace_width()-1: Enabled flag (1 if row is active, 0 if padding)
     pub fn generate_trace(&self, v: &Vec<F>, a: &RowMajorMatrix<F>) -> RowMajorMatrix<F> {
         assert_eq!(
             a.height(),
@@ -444,7 +408,7 @@ mod tests {
     use p3_field::integers::QuotientMap;
     use p3_matrix::dense::RowMajorMatrix;
     use p3_mersenne_31::Mersenne31; // Import the field implementation from p3-baby-bear
-    use p3_uni_stark::{verify, Proof, StarkGenericConfig};
+    use p3_uni_stark::{prove, verify, Proof, StarkGenericConfig};
 
     fn print_trace(trace: &RowMajorMatrix<Mersenne31>) {
         println!("Trace (one row per line):");
@@ -560,46 +524,6 @@ mod tests {
 
         let real_result = vec![Mersenne31::from_int(7), Mersenne31::from_int(10)];
         let result = vector_matrix_multiply(&vector, &matrix);
-        assert_eq!(result, real_result);
-    }
-
-    #[test]
-    fn test_matrix_multiplication() {
-        // [[1, 2, 3], [4, 5, 6]]
-        let matrix_a: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
-            vec![
-                Mersenne31::from_int(1),
-                Mersenne31::from_int(2),
-                Mersenne31::from_int(3),
-                Mersenne31::from_int(4),
-                Mersenne31::from_int(5),
-                Mersenne31::from_int(6),
-            ],
-            3,
-        );
-        // [[1, 2], [3, 4], [5, 6]]
-        let matrix_b: RowMajorMatrix<Mersenne31> = RowMajorMatrix::new(
-            vec![
-                Mersenne31::from_int(1),
-                Mersenne31::from_int(2),
-                Mersenne31::from_int(3),
-                Mersenne31::from_int(4),
-                Mersenne31::from_int(5),
-                Mersenne31::from_int(6),
-            ],
-            2,
-        );
-
-        let real_result = RowMajorMatrix::new(
-            vec![
-                Mersenne31::from_int(22),
-                Mersenne31::from_int(28),
-                Mersenne31::from_int(49),
-                Mersenne31::from_int(64),
-            ],
-            2,
-        );
-        let result = matrix_multiply::<Mersenne31>(&matrix_a, &matrix_b);
         assert_eq!(result, real_result);
     }
 }
