@@ -283,7 +283,7 @@ where
         // sum equal the first element of the vector times the first element of the matrix
         builder.when_first_row().assert_eq(
             current[sum].clone(),
-            current[0].clone() * current[m_sel_init].clone(),
+            current[0].clone() * current[matrix_init].clone(),
         );
 
         // The first element of the vector selector is 1
