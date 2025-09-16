@@ -13,6 +13,7 @@ import ezkl
 from onnx import numpy_helper
 import torch
 from zklora.fp_coding import fixed_point_encode, fixed_point_decode
+import plonky3_py as pl
 
 
 class ProofPaths(NamedTuple):
@@ -265,8 +266,19 @@ async def generate_proofs(
 
             # Flatten to 1D with correct shape
             x = np.array(input_data["input_data"], dtype=np.float32)[0]
-            x_2d = x.reshape(-1, len(W))          # shape: (batch*seq_len, W.shape[0])
+            x_2d = x.reshape(-1, m)          # shape: (batch*seq_len, W.shape[0])
             print("batch x tokens × hidden:", x_2d.shape)
+
+            for i in range(len(x_2d)):
+                v = x_2d[i].tolist()
+                v_encoded = fixed_point_encode(v, fractional_bits=24)
+                start_time = time.time()
+                pl.vector_matrix_multiplication_prove(m, n, v_encoded, W_encoded)
+                end_time = time.time()
+                if verbose:
+                    print(f"Proof gen took {end_time - start_time:.2f} sec")
+                total_prove_time += end_time - start_time
+
             
         else:
             raise ValueError(f"Invalid ZK backend: {zk_backend}")
