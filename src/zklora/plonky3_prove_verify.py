@@ -58,19 +58,8 @@ A = [[0.1, 0.2, 0.3],
      [0.4, 0.5, 0.6],
      [0.7, 0.8, 0.9]]
 
-v2 = [200, 200, 300]
-A2 = [[1, 4, 3],
-     [4, 5, 6],
-     [7, 8, 9]]
-
 v_encoded = fixed_point_encode(v)
 A_encoded = [fixed_point_encode(row) for row in A]
-
-print("v:", v_encoded)
-print("A:", A_encoded)
-
-print("v decoded:", fixed_point_decode(v_encoded))
-print("A decoded:", [fixed_point_decode(row) for row in A_encoded])
 
 proof = pl.vector_matrix_multiplication_prove(3, 3, v2, A2)
 assert pl.vector_matrix_multiplication_verify(3, 3, proof)
@@ -78,7 +67,6 @@ print("proof length:", len(proof))
 
 
 
-"""
 async def main():
      base_model_name = "distilgpt2"
      lora_model_name = "q1e123/peft-starcoder-lora-a100"
@@ -101,4 +89,3 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
     print("Done")
-"""
