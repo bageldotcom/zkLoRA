@@ -9,6 +9,10 @@ import numpy as np
 import onnx
 import onnxruntime
 import ezkl
+# Added for extracting tensors in plonky3 backend
+from onnx import numpy_helper
+import torch
+from zklora.fp_coding import fixed_point_encode, fixed_point_decode
 
 
 class ProofPaths(NamedTuple):
@@ -233,8 +237,37 @@ async def generate_proofs(
                 print(f"Done with {base_name}.\n")
             os.remove(pk_file)
             count_onnx_files += 1
-        elif zk_backend == "plonky3":
-            pass
+        elif zk_backend == "plonky3":            # 1. load the model
+            tensors = {
+                init.name: numpy_helper.to_array(init)   # 2. convert to NumPy
+                for init in onnx_model.graph.initializer
+            }
+
+            A = tensors["A"]      # LoRA A   (in_dim × r)
+            B = tensors["B"]      # LoRA B   (r × out_dim)
+
+            A_t = torch.from_numpy(A)      # or load directly as torch.Tensor
+            B_t = torch.from_numpy(B)
+
+            W = A_t @ B_t
+            m = W.shape[0]
+            n = W.shape[1]
+
+            print("A.shape =", A.shape, "  B.shape =", B.shape)
+            print("W.shape =", W.shape)
+
+            W = W.tolist()
+            W_encoded = [fixed_point_encode(row, fractional_bits=24) for row in W]
+
+            # Read input data
+            with open(json_path, "r") as f:
+                input_data = json.load(f)
+
+            # Flatten to 1D with correct shape
+            x = np.array(input_data["input_data"], dtype=np.float32)[0]
+            x_2d = x.reshape(-1, len(W))          # shape: (batch*seq_len, W.shape[0])
+            print("batch x tokens × hidden:", x_2d.shape)
+            
         else:
             raise ValueError(f"Invalid ZK backend: {zk_backend}")
 
