@@ -254,11 +254,15 @@ async def generate_proofs(
             m = W.shape[0]
             n = W.shape[1]
 
+            print("m =", m, "n =", n)
+
             print("A.shape =", A.shape, "  B.shape =", B.shape)
             print("W.shape =", W.shape)
 
             W = W.tolist()
             W_encoded = [fixed_point_encode(row, fractional_bits=24) for row in W]
+
+            print("W_encoded.shape =", len(W_encoded), len(W_encoded[0]))
 
             # Read input data
             with open(json_path, "r") as f:
@@ -269,16 +273,20 @@ async def generate_proofs(
             x_2d = x.reshape(-1, m)          # shape: (batch*seq_len, W.shape[0])
             print("batch x tokens × hidden:", x_2d.shape)
 
+            count_proofs = 0
             for i in range(len(x_2d)):
                 v = x_2d[i].tolist()
                 v_encoded = fixed_point_encode(v, fractional_bits=24)
+                print("v_encoded.shape =", len(v_encoded))
                 start_time = time.time()
                 pl.vector_matrix_multiplication_prove(m, n, v_encoded, W_encoded)
                 end_time = time.time()
                 if verbose:
                     print(f"Proof gen took {end_time - start_time:.2f} sec")
                 total_prove_time += end_time - start_time
-
+                count_proofs += 1
+                if count_proofs >= 1:
+                    break
             
         else:
             raise ValueError(f"Invalid ZK backend: {zk_backend}")
