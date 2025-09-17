@@ -145,8 +145,8 @@ impl<F: PrimeField> VectorMatrixMultiplicationAIR<F> {
 
     /// Pushes the matrix elements to the trace data with column major order
     fn push_matrix(&self, trace_data: &mut Vec<F>, a: &RowMajorMatrix<F>) {
-        for i in 0..self.m {
-            for j in 0..self.n {
+        for i in 0..self.n {
+            for j in 0..self.m {
                 trace_data.push(a.get(j, i).unwrap());
             }
         }
@@ -605,6 +605,8 @@ mod tests {
             ],
             3,
         );
+
+        println!("matrix: {:?}", matrix);
 
         let air = VectorMatrixMultiplicationAIR::new(3, 3);
         let trace = air.generate_trace(&vector, &matrix);
