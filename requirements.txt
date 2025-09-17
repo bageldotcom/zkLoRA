@@ -1,4 +1,8 @@
-numpy
-pytest
-torch
-transformers 
+torch>=2.0.0
+transformers>=4.30.0
+peft>=0.4.0
+onnx>=1.14.0
+onnxruntime>=1.15.0
+numpy>=1.24.0
+ezkl>=5.0.0
+maturin>=1.9.4
