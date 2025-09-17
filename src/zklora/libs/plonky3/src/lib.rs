@@ -425,7 +425,7 @@ fn vector_matrix_transform(
         }
     }
 
-    let matrix = RowMajorMatrix::new(matrix_flat, m);
+    let matrix = RowMajorMatrix::new(matrix_flat, n);
     (vector, matrix)
 }
 
@@ -576,10 +576,10 @@ mod tests {
     #[test]
     fn test_vector_matrix_multiplication_prove() {
         let vector = vec![1, 2, 3];
-        let matrix = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
-        let proof = vector_matrix_multiplication_prove(3, 3, vector, matrix);
+        let matrix = vec![vec![1, 2], vec![4, 5], vec![7, 8]];
+        let proof = vector_matrix_multiplication_prove(3, 2, vector, matrix);
 
-        let result = vector_matrix_multiplication_verify(3, 3, proof);
+        let result = vector_matrix_multiplication_verify(3, 2, proof);
         assert!(result);
     }
 
