@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "src/zklora/libs/plonky3"
+]
+resolver = "2" 

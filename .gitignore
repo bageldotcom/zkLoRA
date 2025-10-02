@@ -47,3 +47,9 @@ build/
 *.egg
 *.whl
 .pypirc
+
+# Specific Cargo.lock files to ignore
+zklora/libs/Cargo.lock
+Cargo.lock
+
+.coverage
