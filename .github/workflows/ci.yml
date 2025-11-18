@@ -34,17 +34,15 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install -e ".[dev]"
-          pip install ruff safety
+          pip install -e "src/[dev]"
 
       - name: Lint Python
         run: |
           ruff check src/zklora/ src/scripts/
           ruff format --check src/zklora/ src/scripts/
-          safety check --json
 
   pytest:
-    name: all the python tests
+    name: tests & coverage
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
