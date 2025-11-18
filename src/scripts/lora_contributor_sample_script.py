@@ -4,8 +4,8 @@ import time
 
 from zklora import LoRAServer, LoRAServerSocket
 
+
 def main():
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port_a", type=int, default=30000)
@@ -26,6 +26,7 @@ def main():
         print("[A-Server] stopping.")
     stop_event.set()
     t.join()
+
 
 if __name__ == "__main__":
     main()
