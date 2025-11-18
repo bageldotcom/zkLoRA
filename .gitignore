@@ -48,3 +48,4 @@ build/
 *.whl
 .pypirc
 .coverage
+.pytest_cache/
