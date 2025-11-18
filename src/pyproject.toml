@@ -9,7 +9,7 @@ authors = [
     { name = "Bagel", email = "team@bagel.net" },
 ]
 description = "A Python library for zero-knowledge proof generation and verification"
-readme = "../README.md"  # Update path to point to root README
+readme = "../readme.md"  # Update path to point to root README
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -25,6 +25,13 @@ dependencies = [
     "onnxruntime>=1.15.0",
     "ezkl>=5.0.0",
     "blake3>=0.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-cov",
 ]
 
 [project.urls]
