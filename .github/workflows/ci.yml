@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   lint:
-    name: Lint & Security
+    name: lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -62,5 +62,5 @@ jobs:
 
       - name: Run tests (all)
         run: |
-          pytest src/tests/ -v --tb=short --maxfail=1 \
+          pytest tests/ -v --tb=short --maxfail=1 \
             --cov=src/zklora/ --cov-branch --cov-fail-under=40
