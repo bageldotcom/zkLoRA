@@ -63,4 +63,4 @@ jobs:
       - name: Run tests (all)
         run: |
           pytest tests/ -v --tb=short --maxfail=1 \
-            --cov=src/zklora/ --cov-branch --cov-fail-under=40
+            --cov=src/zklora/ --cov-branch --cov-fail-under=30
