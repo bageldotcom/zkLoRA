@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
 class BaseModelToLoRAComm:
     def __init__(self, host_a="127.0.0.1", port_a=30000):
         self.host_a = host_a
@@ -20,16 +21,18 @@ class BaseModelToLoRAComm:
 
     def lora_forward(self, sub_name, arr):
         req = {
-            "request_type":"lora_forward",
+            "request_type": "lora_forward",
             "submodule_name": sub_name,
-            "input_array": arr
+            "input_array": arr,
         }
         resp = self.send_and_recv(req)
         return resp.get("output_array", None)
 
     def end_inference(self):
         req = {"request_type": "end_inference"}
-        resp = self.send_and_recv(req)#, timeout=600.0)  # might be slower if proof gen is big
+        resp = self.send_and_recv(
+            req
+        )  # , timeout=600.0)  # might be slower if proof gen is big
         return resp
 
     def send_and_recv(self, data_dict):
@@ -52,13 +55,18 @@ class BaseModelToLoRAComm:
         s.close()
 
         if not buffer:
-            raise RuntimeError("[B] No data from A (EOF). Possibly A took too long or closed early.")
+            raise RuntimeError(
+                "[B] No data from A (EOF). Possibly A took too long or closed early."
+            )
 
         resp = pickle.loads(buffer)
         return resp
 
+
 class RemoteLoRAWrappedModule(nn.Module):
-    def __init__(self, sub_name, local_sub, comm: BaseModelToLoRAComm, combine_mode="replace"):
+    def __init__(
+        self, sub_name, local_sub, comm: BaseModelToLoRAComm, combine_mode="replace"
+    ):
         super().__init__()
         self.sub_name = sub_name
         self.local_sub = local_sub
@@ -76,6 +84,7 @@ class RemoteLoRAWrappedModule(nn.Module):
         if self.combine_mode == "add_delta":
             return base_out + out_t
         return out_t
+
 
 class BaseModelClient:
     def __init__(
@@ -127,9 +136,13 @@ class BaseModelClient:
                     *parents, child = path_parts
                     m = self._navigate(self.model, parents)
                     orig_sub = getattr(m, child)
-                    wrapped = RemoteLoRAWrappedModule(full_name, orig_sub, comm, self.combine_mode)
+                    wrapped = RemoteLoRAWrappedModule(
+                        full_name, orig_sub, comm, self.combine_mode
+                    )
                     setattr(m, child, wrapped)
-                    print(f"[B] Patched submodule '{full_name}' from {comm.host_a}:{comm.port_a}.")
+                    print(
+                        f"[B] Patched submodule '{full_name}' from {comm.host_a}:{comm.port_a}."
+                    )
                 except Exception as e:
                     print(f"[B] Could not patch '{full_name}': {e}")
 
@@ -144,4 +157,6 @@ class BaseModelClient:
         """Notify all contributors that inference is finished."""
         for comm in self.comms:
             resp = comm.end_inference()
-            print("[B] end_inference => got ack from", comm.host_a, comm.port_a, ":", resp)
+            print(
+                "[B] end_inference => got ack from", comm.host_a, comm.port_a, ":", resp
+            )

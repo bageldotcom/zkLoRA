@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Iterable, List, Union
+from typing import List, Union
 
 from blake3 import blake3  # type: ignore
 
@@ -15,12 +15,13 @@ def _hash_leaf(value: Union[int, float], nonce: bytes) -> bytes:
     then concatenated with the nonce before hashing.
     """
     import struct
+
     if isinstance(value, float):
-        byte_repr = struct.pack('>d', value)  # '>d' = big-endian double (f64)
+        byte_repr = struct.pack(">d", value)  # '>d' = big-endian double (f64)
     else:
         # Treat ints as floats to match Rust f64 representation
-        byte_repr = struct.pack('>d', float(value))
-    
+        byte_repr = struct.pack(">d", float(value))
+
     # Concatenate value bytes with nonce for hiding
     return blake3(byte_repr + nonce).digest()
 
@@ -37,7 +38,7 @@ def _merkle_root(values: List[Union[int, float]], nonce: bytes) -> bytes:
     every internal node always has exactly two children, matching the behaviour
     of dusk-merkle with `Tree::<Item, H, A>::new()` where missing sub-trees are
     equal to the constant `EMPTY_SUBTREE` (32 zero bytes).
-    
+
     Args:
         values: List of numeric values to commit to
         nonce: Random bytes for hiding property
@@ -68,12 +69,13 @@ def _merkle_root(values: List[Union[int, float]], nonce: bytes) -> bytes:
 # Public API (names preserved for backwards compatibility)
 # --------------------------------------------------------------------------------------
 
+
 def commit_activations(activations_path: str) -> str:
     """Return hiding Merkle commitment of activations stored in JSON file.
 
     The JSON is expected to contain a key `input_data` pointing to a list
     of numeric scalars. The commitment includes a random nonce for hiding.
-    
+
     Returns:
         JSON string containing both the Merkle root and nonce:
         {"root": "0x...", "nonce": "0x..."}
@@ -85,7 +87,9 @@ def commit_activations(activations_path: str) -> str:
     try:
         import numpy as np  # local import to avoid hard dependency
 
-        flat_vals = np.asarray(data["input_data"], dtype=np.float64).reshape(-1).tolist()
+        flat_vals = (
+            np.asarray(data["input_data"], dtype=np.float64).reshape(-1).tolist()
+        )
     except Exception:
         # fallback: naïve Python flatten
         def _flatten(x):
@@ -99,25 +103,22 @@ def commit_activations(activations_path: str) -> str:
 
     # Generate random nonce for hiding property
     nonce = os.urandom(32)
-    
+
     # Compute Merkle root with nonce
     root = _merkle_root(flat_vals, nonce)
-    
+
     # Return JSON with both root and nonce
-    commitment_data = {
-        "root": "0x" + root.hex(),
-        "nonce": "0x" + nonce.hex()
-    }
+    commitment_data = {"root": "0x" + root.hex(), "nonce": "0x" + nonce.hex()}
     return json.dumps(commitment_data)
 
 
 def verify_commitment(activations_path: str, commitment: str) -> bool:
     """Verify a hiding Merkle commitment against activations.
-    
+
     Args:
         activations_path: Path to JSON file with activations
         commitment: JSON string containing root and nonce
-    
+
     Returns:
         True if commitment is valid, False otherwise
     """
@@ -126,40 +127,44 @@ def verify_commitment(activations_path: str, commitment: str) -> bool:
         commitment_data = json.loads(commitment)
         root_hex = commitment_data["root"]
         nonce_hex = commitment_data["nonce"]
-        
+
         # Remove "0x" or "0X" prefix if present (case insensitive)
         if root_hex.lower().startswith("0x"):
             root_hex = root_hex[2:]
         if nonce_hex.lower().startswith("0x"):
             nonce_hex = nonce_hex[2:]
-        
+
         # Convert hex to bytes
         expected_root = bytes.fromhex(root_hex)
         nonce = bytes.fromhex(nonce_hex)
-        
+
     except (json.JSONDecodeError, KeyError, ValueError):
         # Invalid commitment format
         return False
-    
+
     # Load and flatten activations
     with open(activations_path, "r") as f:
         data = json.load(f)
-    
+
     try:
         import numpy as np
-        flat_vals = np.asarray(data["input_data"], dtype=np.float64).reshape(-1).tolist()
+
+        flat_vals = (
+            np.asarray(data["input_data"], dtype=np.float64).reshape(-1).tolist()
+        )
     except Exception:
+
         def _flatten(x):
             for y in x:
                 if isinstance(y, (list, tuple)):
                     yield from _flatten(y)
                 else:
                     yield y
+
         flat_vals = list(_flatten(data["input_data"]))
-    
+
     # Recompute root with provided nonce
     computed_root = _merkle_root(flat_vals, nonce)
-    
+
     # Compare roots
     return computed_root == expected_root
-
