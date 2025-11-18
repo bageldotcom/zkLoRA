@@ -190,13 +190,18 @@ async def generate_proofs(
         if verbose:
             print("Local ONNX output shape:", out[0].shape)
 
-        # 3) gen_witness (async)
+        # 3) gen_witness (async via background thread)
         if verbose:
             print("Generating witness (async)...")
         start_time = time.time()
         try:
-            await ezkl.gen_witness(
-                data=json_path, model=circuit_name, output=witness_file
+            # Offload blocking ezkl.gen_witness call to a worker thread so that
+            # the async event loop can continue making progress.
+            await asyncio.to_thread(
+                ezkl.gen_witness,
+                data=json_path,
+                model=circuit_name,
+                output=witness_file,
             )
         except RuntimeError as e:
             print(f"Failed to generate witness: {e}")
