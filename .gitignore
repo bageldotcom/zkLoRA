@@ -47,3 +47,4 @@ build/
 *.egg
 *.whl
 .pypirc
+.coverage
