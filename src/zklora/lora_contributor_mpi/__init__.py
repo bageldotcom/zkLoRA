@@ -1,20 +1,15 @@
-import argparse
 import socket
 import threading
 import pickle
-import time
 import os
-import glob
 import asyncio
-import numpy as np
 
 import torch
-import torch.nn as nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 from peft import PeftModel
 
 # from zklora with the MPI exporter & proof generator
-from ..zk_proof_generator import generate_proofs, resolve_proof_paths
+from ..zk_proof_generator import generate_proofs
 from ..mpi_lora_onnx_exporter import export_lora_onnx_json_mpi
 
 
@@ -120,12 +115,13 @@ class LoRAServer:
 
 
 class LoRAServerSocket(threading.Thread):
-    def __init__(self, host, port, lora_server: LoRAServer, stop_event):
+    def __init__(self, host, port, lora_server: LoRAServer, stop_event, stop_timeout: float = 1200.0):
         super().__init__()
         self.host = host
         self.port = port
         self.lora_server = lora_server
         self.stop_event = stop_event
+        self.stop_timeout = stop_timeout
 
     def run(self):
         import socket
@@ -134,7 +130,7 @@ class LoRAServerSocket(threading.Thread):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.bind((self.host, self.port))
         srv.listen(5)
-        srv.settimeout(1200.0)
+        srv.settimeout(self.stop_timeout)
 
         print(
             f"[A-Server] Running on {self.host}:{self.port}, local artifacts in '{self.lora_server.out_dir}'"

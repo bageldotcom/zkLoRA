@@ -16,7 +16,7 @@ def main():
 
     stop_event = threading.Event()
     server_obj = LoRAServer(args.base_model, args.lora_model_id, args.out_dir)
-    t = LoRAServerSocket(args.host, args.port_a, server_obj, stop_event)
+    t = LoRAServerSocket(args.host, args.port_a, server_obj, stop_event, stop_timeout=1.0)
     t.start()
 
     try:
