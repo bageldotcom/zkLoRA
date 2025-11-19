@@ -1,6 +1,6 @@
 # zklora/mpi_lora_onnx_exporter.py
 """
-New code specifically for 'split inference' (MPI) scenario, 
+New code specifically for 'split inference' (MPI) scenario,
 similar to lora_onnx_exporter but with different approach or naming to avoid collisions.
 """
 
@@ -9,14 +9,13 @@ import json
 import torch
 import numpy as np
 import torch.nn as nn
-from peft import PeftModel
 
 
 def normalize_lora_matrices_mpi(
     A: torch.Tensor, B: torch.Tensor, x_data: np.ndarray
 ) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
     """
-    Same shape logic as the older function, but with a new name 
+    Same shape logic as the older function, but with a new name
     to avoid collisions with the old version.
     x_data => (batch, seq_len, hidden_dim).
     """
@@ -43,7 +42,7 @@ def normalize_lora_matrices_mpi(
 
 class LoraShapeTransformerMPI(nn.Module):
     """
-    Variation of LoraShapeTransformer used specifically for 
+    Variation of LoraShapeTransformer used specifically for
     the split-inference approach, with a new class name to avoid collisions.
     """
 
@@ -72,7 +71,7 @@ def export_lora_onnx_json_mpi(
     verbose: bool = False,
 ):
     """
-    The 'split inference' version of the ONNX+JSON exporter. 
+    The 'split inference' version of the ONNX+JSON exporter.
     Similar logic but a different name to avoid collisions with the old function.
     """
     import torch.onnx
@@ -85,13 +84,17 @@ def export_lora_onnx_json_mpi(
     # If the submodule doesn't have lora_A/lora_B, skip
     if not (hasattr(submodule, "lora_A") and hasattr(submodule, "lora_B")):
         if verbose:
-            print(f"[export_lora_onnx_json_mpi] No lora_A/B in submodule '{sub_name}', skipping.")
+            print(
+                f"[export_lora_onnx_json_mpi] No lora_A/B in submodule '{sub_name}', skipping."
+            )
         return
 
     a_keys = list(submodule.lora_A.keys()) if hasattr(submodule.lora_A, "keys") else []
     if not a_keys:
         if verbose:
-            print(f"[export_lora_onnx_json_mpi] No adapter keys in submodule.lora_A for '{sub_name}'.")
+            print(
+                f"[export_lora_onnx_json_mpi] No adapter keys in submodule.lora_A for '{sub_name}'."
+            )
         return
 
     A_mod = submodule.lora_A[a_keys[0]]
@@ -102,14 +105,19 @@ def export_lora_onnx_json_mpi(
 
     try:
         from .mpi_lora_onnx_exporter import normalize_lora_matrices_mpi
-        A_fixed, B_fixed, in_dim, rank, out_dim = normalize_lora_matrices_mpi(A, B, x_data)
+
+        A_fixed, B_fixed, in_dim, rank, out_dim = normalize_lora_matrices_mpi(
+            A, B, x_data
+        )
     except ValueError as e:
         if verbose:
             print(f"Shape fix error for '{sub_name}': {e}")
         return
 
     # Build the shape-transformer
-    lora_transformer = LoraShapeTransformerMPI(A_fixed, B_fixed, batch_size, seq_len, hidden_dim).eval()
+    lora_transformer = LoraShapeTransformerMPI(
+        A_fixed, B_fixed, batch_size, seq_len, hidden_dim
+    ).eval()
 
     safe_name = sub_name.replace(".", "_").replace("/", "_")
     os.makedirs(output_dir, exist_ok=True)
@@ -135,7 +143,6 @@ def export_lora_onnx_json_mpi(
             print(f"Export error for '{sub_name}': {e}")
 
     # Save JSON
-    import json
     json_path = os.path.join(output_dir, f"{safe_name}.json")
     with open(json_path, "w") as f:
         row_data = x_1d.numpy().tolist()

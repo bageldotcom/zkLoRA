@@ -1,25 +1,22 @@
-import argparse
 import socket
 import threading
 import pickle
-import time
 import os
-import glob
 import asyncio
-import numpy as np
 
 import torch
-import torch.nn as nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 from peft import PeftModel
 
 # from zklora with the MPI exporter & proof generator
-from ..zk_proof_generator import generate_proofs, resolve_proof_paths
+from ..zk_proof_generator import generate_proofs
 from ..mpi_lora_onnx_exporter import export_lora_onnx_json_mpi
+
 
 def read_file_as_bytes(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
+
 
 def strip_prefix(raw_name: str) -> str:
     """
@@ -30,8 +27,9 @@ def strip_prefix(raw_name: str) -> str:
     name2 = raw_name
     for pfx in ["base_model.model.", "base_model.", "model."]:
         if name2.startswith(pfx):
-            name2 = name2[len(pfx):]
+            name2 = name2[len(pfx) :]
     return name2.strip()
+
 
 class LoRAServer:
     def __init__(self, base_model_name: str, lora_model_id: str, out_dir: str):
@@ -91,18 +89,20 @@ class LoRAServer:
                 x_data=last_in,
                 submodule=mod,
                 output_dir=self.out_dir,
-                verbose=True
+                verbose=True,
             )
         self.session_data.clear()
 
         # generate proofs synchronously
-        print("[A] Running generate_proofs(...) via asyncio.run(...) in the same thread.")
+        print(
+            "[A] Running generate_proofs(...) via asyncio.run(...) in the same thread."
+        )
         proof_res = asyncio.run(
             generate_proofs(
                 onnx_dir=self.out_dir,
                 json_dir=self.out_dir,
                 output_dir=self.out_dir,
-                verbose=True
+                verbose=True,
             )
         )
 
@@ -113,23 +113,35 @@ class LoRAServer:
 
         return
 
+
 class LoRAServerSocket(threading.Thread):
-    def __init__(self, host, port, lora_server: LoRAServer, stop_event):
+    def __init__(
+        self,
+        host,
+        port,
+        lora_server: LoRAServer,
+        stop_event,
+        stop_timeout: float = 1200.0,
+    ):
         super().__init__()
         self.host = host
         self.port = port
         self.lora_server = lora_server
         self.stop_event = stop_event
+        self.stop_timeout = stop_timeout
 
     def run(self):
         import socket
+
         print(f"[A-Server] listening on {self.host}:{self.port}")
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.bind((self.host, self.port))
         srv.listen(5)
-        srv.settimeout(1200.0)
+        srv.settimeout(self.stop_timeout)
 
-        print(f"[A-Server] Running on {self.host}:{self.port}, local artifacts in '{self.lora_server.out_dir}'")
+        print(
+            f"[A-Server] Running on {self.host}:{self.port}, local artifacts in '{self.lora_server.out_dir}'"
+        )
         try:
             while not self.stop_event.is_set():
                 try:
@@ -147,11 +159,11 @@ class LoRAServerSocket(threading.Thread):
             if not data:
                 return
             req = pickle.loads(data)
-            rtype = req.get("request_type","lora_forward")
+            rtype = req.get("request_type", "lora_forward")
 
             if rtype == "init_request":
                 submods = self.lora_server.list_lora_injection_points()
-                resp = {"response_type":"init_response","injection_points": submods}
+                resp = {"response_type": "init_response", "injection_points": submods}
 
             elif rtype == "lora_forward":
                 sname = req["submodule_name"]
@@ -159,8 +171,8 @@ class LoRAServerSocket(threading.Thread):
                 tin = torch.tensor(arr, dtype=torch.float32)
                 out = self.lora_server.apply_lora(sname, tin)
                 resp = {
-                    "response_type":"lora_forward_response",
-                    "output_array": out.cpu().numpy()
+                    "response_type": "lora_forward_response",
+                    "output_array": out.cpu().numpy(),
                 }
 
             elif rtype == "end_inference":
@@ -168,7 +180,7 @@ class LoRAServerSocket(threading.Thread):
                 self.lora_server.finalize_proofs_and_collect()
                 resp = {
                     "response_type": "end_inference_ack",
-                    "message": "A finished proof generation locally. B can close."
+                    "message": "A finished proof generation locally. B can close.",
                 }
 
             else:
