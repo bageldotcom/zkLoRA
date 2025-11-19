@@ -115,7 +115,14 @@ class LoRAServer:
 
 
 class LoRAServerSocket(threading.Thread):
-    def __init__(self, host, port, lora_server: LoRAServer, stop_event, stop_timeout: float = 1200.0):
+    def __init__(
+        self,
+        host,
+        port,
+        lora_server: LoRAServer,
+        stop_event,
+        stop_timeout: float = 1200.0,
+    ):
         super().__init__()
         self.host = host
         self.port = port
