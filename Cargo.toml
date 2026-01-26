@@ -1,0 +1,29 @@
+[package]
+name = "zklora"
+version = "0.1.0"
+edition = "2021"
+authors = ["bageldotcom"]
+description = "Zero-knowledge proofs for NF4-quantized LoRA weights"
+license = "MIT"
+repository = "https://github.com/bageldotcom/zkLoRA"
+
+[dependencies]
+ark-ff = "0.4"
+ark-bn254 = "0.4"
+ark-relations = "0.4"
+ark-r1cs-std = "0.4"
+ark-crypto-primitives = "0.4"
+ark-serialize = "0.4"
+ark-std = "0.4"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[lib]
+name = "zklora"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
