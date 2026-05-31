@@ -50,6 +50,7 @@ def generate_proofs(
 def batch_verify_proofs(
     proof_dir: str = "proof_artifacts",
     transcript: str | Iterable[TranscriptEntry] | None = None,
+    expected_adapters=None,
     verbose: bool = False,
 ) -> tuple[float, int]:
     """Verify native ZKLoRA proof artifacts against the base user's transcript."""
@@ -58,7 +59,11 @@ def batch_verify_proofs(
         raise ProofContractError(
             "native ZKLoRA verification requires the base user's transcript"
         )
-    total_time, count = verify_artifacts(proof_dir, transcript)
+    if expected_adapters is None:
+        raise ProofContractError(
+            "native ZKLoRA verification requires a pre-inference adapter manifest"
+        )
+    total_time, count = verify_artifacts(proof_dir, transcript, expected_adapters)
     if verbose:
         print(f"Verified {count} native ZKLoRA proof artifacts in {total_time:.2f}s")
     return total_time, count

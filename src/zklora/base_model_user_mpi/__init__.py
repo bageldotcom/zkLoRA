@@ -1,6 +1,7 @@
+import json
 import socket
-import pickle
 import uuid
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,68 @@ from ..proof_contract import (
     quantize_nested,
     write_transcript,
 )
+
+
+_JSON_LENGTH_BYTES = 8
+
+
+def _json_ready(value: Any) -> Any:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    if hasattr(value, "tolist"):
+        return _json_ready(value.tolist())
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def _send_json_message(sock: socket.socket, message: dict[str, Any]) -> None:
+    payload = json.dumps(
+        _json_ready(message),
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    sock.sendall(len(payload).to_bytes(_JSON_LENGTH_BYTES, "big") + payload)
+
+
+def _recv_exact(
+    sock: socket.socket, size: int, allow_empty: bool = False
+) -> bytes | None:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        try:
+            chunk = sock.recv(remaining)
+        except socket.timeout as exc:
+            raise RuntimeError("Timed out while reading JSON message.") from exc
+        if not chunk:
+            if allow_empty and remaining == size:
+                return None
+            raise RuntimeError("Unexpected EOF while reading JSON message.")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _recv_json_message(sock: socket.socket) -> dict[str, Any] | None:
+    header = _recv_exact(sock, _JSON_LENGTH_BYTES, allow_empty=True)
+    if header is None:
+        return None
+    size = int.from_bytes(header, "big")
+    if size <= 0:
+        raise RuntimeError("Received empty JSON message.")
+    payload = _recv_exact(sock, size)
+    if payload is None:
+        raise RuntimeError("Unexpected EOF while reading JSON payload.")
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Received invalid JSON message.") from exc
 
 
 class BaseModelToLoRAComm:
@@ -45,30 +108,18 @@ class BaseModelToLoRAComm:
         return resp
 
     def send_and_recv(self, data_dict):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect((self.host_a, self.port_a))
-        bin_req = pickle.dumps(data_dict)
-        s.sendall(bin_req)
-        s.shutdown(socket.SHUT_WR)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((self.host_a, self.port_a))
+            _send_json_message(s, data_dict)
+            s.shutdown(socket.SHUT_WR)
 
-        buffer = b""
-        s.settimeout(1200.0)  # give more time if proof generation is slow
-        while True:
-            try:
-                chunk = s.recv(4096)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            buffer += chunk
-        s.close()
+            s.settimeout(1200.0)  # give more time if proof generation is slow
+            resp = _recv_json_message(s)
 
-        if not buffer:
+        if resp is None:
             raise RuntimeError(
                 "[B] No data from A (EOF). Possibly A took too long or closed early."
             )
-
-        resp = pickle.loads(buffer)
         return resp
 
 
@@ -105,10 +156,12 @@ class RemoteLoRAWrappedModule(nn.Module):
             remote_resp = self.comm.lora_forward(self.sub_name, arr)
         if isinstance(remote_resp, dict):
             remote_out = remote_resp.get("output_array")
+            q_delta = remote_resp.get("q_delta")
             scaling_num = int(remote_resp.get("scaling_num", 1))
             scaling_den = int(remote_resp.get("scaling_den", 1))
         else:
             remote_out = remote_resp
+            q_delta = None
             scaling_num = (
                 self.transcript_recorder.scaling_num if self.transcript_recorder else 1
             )
@@ -125,6 +178,7 @@ class RemoteLoRAWrappedModule(nn.Module):
                 remote_out,
                 scaling_num=scaling_num,
                 scaling_den=scaling_den,
+                q_delta_values=q_delta,
             )
         if self.combine_mode == "add_delta":
             return base_out + out_t
@@ -153,6 +207,7 @@ class ProofTranscriptRecorder:
         delta_values,
         scaling_num: int | None = None,
         scaling_den: int | None = None,
+        q_delta_values=None,
     ):
         x_rows = _canonical_rows(x_values)
         delta_rows = _canonical_rows(delta_values)
@@ -161,12 +216,23 @@ class ProofTranscriptRecorder:
                 f"transcript row mismatch for {module_name}: "
                 f"{len(x_rows)} inputs vs {len(delta_rows)} deltas"
             )
+        if q_delta_values is None:
+            q_delta_rows = [
+                flatten(quantize_nested(delta_row, self.fixed_point))
+                for delta_row in delta_rows
+            ]
+        else:
+            q_delta_rows = _canonical_int_rows(q_delta_values)
+        if len(x_rows) != len(q_delta_rows):
+            raise ValueError(
+                f"transcript row mismatch for {module_name}: "
+                f"{len(x_rows)} inputs vs {len(q_delta_rows)} q_deltas"
+            )
         entries: list[TranscriptEntry] = []
-        for x_row, delta_row in zip(x_rows, delta_rows):
+        for x_row, q_delta in zip(x_rows, q_delta_rows):
             invocation_index = self._counts.get(module_name, 0)
             self._counts[module_name] = invocation_index + 1
             q_x = flatten(quantize_nested(x_row, self.fixed_point))
-            q_delta = flatten(quantize_nested(delta_row, self.fixed_point))
             entry = TranscriptEntry(
                 session_id=self.session_id,
                 module_name=module_name,
@@ -206,6 +272,20 @@ def _canonical_rows(values):
     if tensor.ndim == 1:
         return [tensor.cpu().numpy().tolist()]
     return tensor.reshape(-1, tensor.shape[-1]).cpu().numpy().tolist()
+
+
+def _canonical_int_rows(values):
+    tensor = torch.as_tensor(_to_list(values), dtype=torch.int64)
+    if tensor.numel() == 0:
+        return []
+    if tensor.ndim == 0:
+        return [[int(tensor.item())]]
+    if tensor.ndim == 1:
+        return [[int(v) for v in tensor.cpu().numpy().tolist()]]
+    return [
+        [int(v) for v in row]
+        for row in tensor.reshape(-1, tensor.shape[-1]).cpu().numpy().tolist()
+    ]
 
 
 class BaseModelClient:

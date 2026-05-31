@@ -12,10 +12,13 @@ def main():
     parser.add_argument("--base_model", default="distilgpt2")
     parser.add_argument("--lora_model_id", default="ng0-k1/distilgpt2-finetuned-es")
     parser.add_argument("--out_dir", default="proof_artifacts")
+    parser.add_argument("--adapter_manifest", default="adapter-manifest.json")
     args = parser.parse_args()
 
     stop_event = threading.Event()
     server_obj = LoRAServer(args.base_model, args.lora_model_id, args.out_dir)
+    server_obj.write_adapter_manifest(args.adapter_manifest)
+    print(f"[A-Server] wrote adapter manifest => {args.adapter_manifest}")
     t = LoRAServerSocket(
         args.host, args.port_a, server_obj, stop_event, stop_timeout=1.0
     )

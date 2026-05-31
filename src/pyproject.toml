@@ -36,6 +36,6 @@ dev = [
 "Bug Tracker" = "https://github.com/bagel-org/zklora/issues"
 
 [tool.maturin]
-features = ["python"]
+features = ["extension-module"]
 python-source = "."
 module-name = "zklora._native_prover"

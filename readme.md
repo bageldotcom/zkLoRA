@@ -28,9 +28,9 @@ Low-Rank Adaptation (LoRA) is a widely adopted method for customizing large-scal
 1. **Base Model User Verification**: The user must confirm that the LoRA weights are effective when paired with the intended base model.
 2. **LoRA Contributor Protection**: The contributor must keep their proprietary LoRA weights private until compensation is assured.
 
-To solve this, we created **ZKLoRA** a zero-knowledge verification protocol that relies on polynomial commitments, succinct proofs, and multi-party inference to verify LoRA–base model compatibility without exposing LoRA weights.
+To solve this, we created **ZKLoRA** a zero-knowledge verification protocol that relies on commitments, succinct proofs, and multi-party inference to verify exact LoRA delta computation for a pre-agreed adapter without exposing LoRA weights.
 
-This implementation uses a native Halo2 backend for transcript-bound proof artifacts. The v1 proof contract verifies exact quantized LoRA delta correctness for the statement the base user actually sent and received; it does not claim an end-to-end proof that the base model computed those activations.
+This implementation uses a native Halo2 backend for transcript-bound proof artifacts. The v2 proof contract verifies exact quantized LoRA delta correctness for the statement the base user actually sent and received, and binds the proof to a pre-inference adapter manifest. It does not claim an end-to-end proof that the base model computed those activations.
 
 For detailed information about this research, please refer to [our paper](https://arxiv.org/abs/2501.13965).
 
@@ -45,6 +45,7 @@ pip install zklora
 
 Use `src/scripts/lora_contributor_sample_script.py` to:
 - Host LoRA submodules
+- Write a pre-inference adapter manifest
 - Handle inference requests
 - Generate proof artifacts
 
@@ -62,10 +63,12 @@ def main():
     parser.add_argument("--base_model", default="distilgpt2")
     parser.add_argument("--lora_model_id", default="ng0-k1/distilgpt2-finetuned-es")
     parser.add_argument("--out_dir", default="a-out")
+    parser.add_argument("--adapter_manifest", default="adapter-manifest.json")
     args = parser.parse_args()
 
     stop_event = threading.Event()
     server_obj = LoRAServer(args.base_model, args.lora_model_id, args.out_dir)
+    server_obj.write_adapter_manifest(args.adapter_manifest)
     t = LoRAServerSocket(args.host, args.port_a, server_obj, stop_event)
     t.start()
 
@@ -128,7 +131,7 @@ def main():
     # End inference => A finalizes native ZKLoRA proof artifacts
     client.end_inference()
     client.transcript.write("b-transcript.json")
-    print("[B] done. B can now fetch proof files from A and verify them against b-transcript.json.")
+    print("[B] done. B can now fetch proof files from A and verify them against b-transcript.json and the pre-agreed adapter manifest.")
 
 if __name__=="__main__":
     main()
@@ -144,7 +147,7 @@ Use `src/scripts/verify_proofs.py` to validate the proof artifacts:
 Verify LoRA proof artifacts in a given directory.
 
 Example usage:
-  python verify_proofs.py --proof_dir a-out --transcript b-transcript.json --verbose
+  python verify_proofs.py --proof_dir a-out --transcript b-transcript.json --expected_adapters adapter-manifest.json --verbose
 """
 
 import argparse
@@ -167,6 +170,12 @@ def main():
         help="Base user transcript JSON captured during inference."
     )
     parser.add_argument(
+        "--expected_adapters",
+        type=str,
+        required=True,
+        help="Pre-inference adapter manifest JSON agreed by the verifier."
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print more details during verification."
@@ -176,6 +185,7 @@ def main():
     total_verify_time, num_proofs = batch_verify_proofs(
         proof_dir=args.proof_dir,
         transcript=args.transcript,
+        expected_adapters=args.expected_adapters,
         verbose=args.verbose
     )
     print(f"Done verifying {num_proofs} proofs. Total time: {total_verify_time:.2f}s")
@@ -310,19 +320,19 @@ For detailed information about the codebase organization and implementation deta
 
 <table>
 <tr>
-<td>✓</td><td><strong>Trust-Minimized Verification:</strong> Zero-knowledge proofs enable secure LoRA validation</td>
+<td>✓</td><td><strong>Trust-Minimized Delta Verification:</strong> Zero-knowledge proofs validate exact quantized LoRA deltas for a pre-agreed adapter</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Rapid Verification:</strong> 1-2 second processing per module, even for billion-parameter models</td>
+<td>✓</td><td><strong>Native Halo2 Backend:</strong> Proofs no longer depend on EZKL/ONNX artifacts</td>
 </tr>
 <tr>
 <td>✓</td><td><strong>Multi-Party Inference:</strong> Protected activation exchange between parties</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Complete Privacy:</strong> LoRA weights remain confidential while ensuring compatibility</td>
+<td>✓</td><td><strong>Adapter Weight Privacy:</strong> LoRA weights remain confidential while the committed adapter identity is checked</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Production Ready:</strong> Efficiently scales to handle multiple LoRA modules</td>
+<td>✓</td><td><strong>Benchmark Required:</strong> Real-shape proving and verification performance should be measured for each deployment target</td>
 </tr>
 </table>
 

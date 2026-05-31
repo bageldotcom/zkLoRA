@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-BACKEND_ID = "zklora-halo2-v1"
-SCHEMA_VERSION = 1
+BACKEND_ID = "zklora-halo2-v2"
+SCHEMA_VERSION = 2
 COMMITMENT_SCHEME = "sha256-canonical-lora-matrices-v1"
-NATIVE_COMMITMENT_SCHEME = "field-linear-lora-matrices-v1"
+ADAPTER_COMMITMENT_SCHEME = "poseidon-pasta-fp-adapter-v1"
 INVOCATION_STRATEGY = "one-proof-per-module-invocation-v1"
 
 
@@ -240,13 +240,48 @@ def lora_commitment(
     return digest_hex(payload)
 
 
-def native_lora_commitment(a: list[list[int]], b: list[list[int]]) -> int:
-    accumulator = 0
-    coefficient = 1
-    for value in flatten(a) + flatten(b):
-        accumulator += coefficient * int(value)
-        coefficient += 1
-    return accumulator
+def adapter_commitment_payload(
+    a: list[list[int]],
+    b: list[list[int]],
+    scaling_num: int,
+    scaling_den: int,
+    fixed_point: FixedPointConfig,
+) -> dict[str, Any]:
+    rank = len(a)
+    in_dim = len(a[0]) if a else 0
+    out_dim = len(b)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "in_dim": in_dim,
+        "rank": rank,
+        "out_dim": out_dim,
+        "fixed_point": asdict(fixed_point),
+        "scaling_num": int(scaling_num),
+        "scaling_den": int(scaling_den),
+        "a": a,
+        "b": b,
+    }
+
+
+def adapter_commitment(
+    a: list[list[int]],
+    b: list[list[int]],
+    scaling_num: int,
+    scaling_den: int,
+    fixed_point: FixedPointConfig,
+) -> str:
+    native = _native_module()
+    if native is None:
+        raise ProofContractError(
+            "native Halo2 prover is unavailable; build/install zklora with maturin"
+        )
+    return str(
+        native.adapter_commitment(
+            canonical_json(
+                adapter_commitment_payload(a, b, scaling_num, scaling_den, fixed_point)
+            )
+        )
+    )
 
 
 def circuit_id(
@@ -292,6 +327,13 @@ def statement_from_witness(witness: InvocationWitness) -> dict[str, Any]:
     adapter_metadata.setdefault("rank", witness.rank)
     adapter_metadata.setdefault("in_dim", witness.in_dim)
     adapter_metadata.setdefault("out_dim", witness.out_dim)
+    commitment_value = adapter_commitment(
+        witness.a,
+        witness.b,
+        witness.scaling_num,
+        witness.scaling_den,
+        witness.fixed_point,
+    )
 
     statement = {
         "schema_version": SCHEMA_VERSION,
@@ -307,16 +349,21 @@ def statement_from_witness(witness: InvocationWitness) -> dict[str, Any]:
         "fixed_point": asdict(witness.fixed_point),
         "adapter_metadata": adapter_metadata,
         "lora_commitment": lora_commitment(witness.a, witness.b, adapter_metadata),
-        "native_lora_commitment": {
-            "scheme": NATIVE_COMMITMENT_SCHEME,
-            "value": native_lora_commitment(witness.a, witness.b),
+        "adapter_commitment": {
+            "scheme": ADAPTER_COMMITMENT_SCHEME,
+            "value": commitment_value,
         },
         "circuit_id": circuit,
         "vk_fingerprint": vk_fingerprint(circuit),
         "commitment_scheme": COMMITMENT_SCHEME,
         "invocation_strategy": INVOCATION_STRATEGY,
     }
+    statement["statement_digest"] = digest_hex(_statement_digest_payload(statement))
     return statement
+
+
+def _statement_digest_payload(statement: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in statement.items() if key != "statement_digest"}
 
 
 def transcript_entry_from_statement(statement: dict[str, Any]) -> TranscriptEntry:
@@ -365,7 +412,8 @@ def _native_statement_json(statement: dict[str, Any]) -> str:
         "rank": int(statement["adapter_metadata"]["rank"]),
         "scaling_num": int(statement["scaling"]["num"]),
         "scaling_den": int(statement["scaling"]["den"]),
-        "lora_commitment": int(statement["native_lora_commitment"]["value"]),
+        "adapter_commitment": str(statement["adapter_commitment"]["value"]),
+        "statement_digest": statement["statement_digest"],
     }
     return canonical_json(payload)
 
@@ -405,11 +453,13 @@ def write_invocation_artifacts(
     )
     proof_kind = "native-halo2"
     vk = {
+        "schema_version": SCHEMA_VERSION,
         "backend": BACKEND_ID,
         "circuit_id": statement["circuit_id"],
         "vk_fingerprint": statement["vk_fingerprint"],
     }
     pk = {
+        "schema_version": SCHEMA_VERSION,
         "backend": BACKEND_ID,
         "circuit_id": statement["circuit_id"],
         "pk_fingerprint": digest_hex({"pk_for_circuit": statement["circuit_id"]}),
@@ -421,7 +471,8 @@ def write_invocation_artifacts(
         "statement_file": statement_path.name,
         "vk_file": vk_path.name,
         "pk_file": pk_path.name,
-        "statement_digest": digest_hex(statement),
+        "statement_digest": statement["statement_digest"],
+        "statement_file_digest": digest_hex(statement),
         "proof_digest": hashlib.sha256(proof_bytes).hexdigest(),
         "proof_kind": proof_kind,
         "vk_digest": digest_hex(vk),
@@ -478,11 +529,102 @@ def write_transcript(
     Path(path).write_text(canonical_json(payload) + "\n", encoding="utf-8")
 
 
+def adapter_manifest_entry(
+    module_name: str,
+    a: list[list[int]],
+    b: list[list[int]],
+    scaling_num: int,
+    scaling_den: int,
+    fixed_point: FixedPointConfig,
+) -> dict[str, Any]:
+    rank = len(a)
+    in_dim = len(a[0]) if a else 0
+    out_dim = len(b)
+    validate_matrix(a, rank, in_dim, "A")
+    validate_matrix(b, out_dim, rank, "B")
+    return {
+        "module_name": module_name,
+        "rank": rank,
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "fixed_point": asdict(fixed_point),
+        "scaling": {"num": int(scaling_num), "den": int(scaling_den)},
+        "adapter_commitment": {
+            "scheme": ADAPTER_COMMITMENT_SCHEME,
+            "value": adapter_commitment(
+                a, b, int(scaling_num), int(scaling_den), fixed_point
+            ),
+        },
+    }
+
+
+def write_adapter_manifest(
+    path: str | os.PathLike[str], entries: Iterable[dict[str, Any]]
+) -> None:
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "backend": BACKEND_ID,
+        "commitment_scheme": ADAPTER_COMMITMENT_SCHEME,
+        "adapters": list(entries),
+    }
+    Path(path).write_text(canonical_json(payload) + "\n", encoding="utf-8")
+
+
+def load_expected_adapters(
+    expected_adapters: str
+    | os.PathLike[str]
+    | dict[str, Any]
+    | Iterable[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if isinstance(expected_adapters, (str, os.PathLike)):
+        data: Any = load_json(expected_adapters)
+    elif isinstance(expected_adapters, dict):
+        data = expected_adapters
+    else:
+        data = {"adapters": list(expected_adapters)}
+
+    adapters = data.get("adapters") if isinstance(data, dict) else None
+    if adapters is None:
+        raise ProofContractError("expected adapter manifest must contain adapters")
+
+    index: dict[str, dict[str, Any]] = {}
+    for entry in adapters:
+        module_name = entry["module_name"]
+        if module_name in index:
+            raise ProofContractError(f"duplicate expected adapter for {module_name}")
+        index[module_name] = entry
+    return index
+
+
+def statement_matches_expected_adapter(
+    statement: dict[str, Any], expected: dict[str, Any]
+) -> bool:
+    return (
+        statement["module_name"] == expected["module_name"]
+        and int(statement["adapter_metadata"]["rank"]) == int(expected["rank"])
+        and len(statement["x"]) == int(expected["in_dim"])
+        and len(statement["delta"]) == int(expected["out_dim"])
+        and statement["fixed_point"] == expected["fixed_point"]
+        and statement["scaling"] == expected["scaling"]
+        and statement["adapter_commitment"] == expected["adapter_commitment"]
+    )
+
+
 def verify_artifact_set(
     statement_path: str | os.PathLike[str],
     transcript_entries: Iterable[TranscriptEntry],
+    expected_adapters: dict[str, dict[str, Any]],
 ) -> None:
     statement = load_json(statement_path)
+    if (
+        statement.get("schema_version") != SCHEMA_VERSION
+        or statement.get("backend") != BACKEND_ID
+    ):
+        raise ProofContractError("unsupported proof artifact schema/backend")
+    if statement.get("statement_digest") != digest_hex(
+        _statement_digest_payload(statement)
+    ):
+        raise ProofContractError("statement digest mismatch")
     statement_path = Path(statement_path)
     prefix_text = str(statement_path)
     suffix = ".zklora.statement.json"
@@ -507,6 +649,13 @@ def verify_artifact_set(
         raise ProofContractError("statement is missing from verifier transcript")
     if not statement_matches_transcript(statement, entry):
         raise ProofContractError("statement does not match verifier transcript")
+    expected_adapter = expected_adapters.get(statement["module_name"])
+    if expected_adapter is None:
+        raise ProofContractError(
+            "statement module is missing from expected adapter manifest"
+        )
+    if not statement_matches_expected_adapter(statement, expected_adapter):
+        raise ProofContractError("statement does not match expected adapter manifest")
 
     expected_circuit = circuit_id(
         len(statement["x"]),
@@ -520,11 +669,13 @@ def verify_artifact_set(
         raise ProofContractError(
             "statement vk_fingerprint does not match expected circuit"
         )
-    native_commitment = statement.get("native_lora_commitment", {})
-    if native_commitment.get("scheme") != NATIVE_COMMITMENT_SCHEME:
-        raise ProofContractError("statement native LoRA commitment scheme mismatch")
+    adapter = statement.get("adapter_commitment", {})
+    if adapter.get("scheme") != ADAPTER_COMMITMENT_SCHEME:
+        raise ProofContractError("statement adapter commitment scheme mismatch")
 
     vk = load_json(vk_path)
+    if vk.get("schema_version") != SCHEMA_VERSION or vk.get("backend") != BACKEND_ID:
+        raise ProofContractError("unsupported verification key schema/backend")
     if vk.get("circuit_id") != expected_circuit:
         raise ProofContractError("verification key circuit_id mismatch")
     if vk.get("vk_fingerprint") != statement["vk_fingerprint"]:
@@ -532,6 +683,11 @@ def verify_artifact_set(
 
     meta = load_json(meta_path)
     proof_bytes = proof_path.read_bytes()
+    if (
+        meta.get("schema_version") != SCHEMA_VERSION
+        or meta.get("backend") != BACKEND_ID
+    ):
+        raise ProofContractError("unsupported metadata schema/backend")
     if meta.get("proof_kind") != "native-halo2":
         raise ProofContractError("unsupported proof kind; expected native-halo2")
     native = _native_module()
@@ -540,8 +696,10 @@ def verify_artifact_set(
     if not native.verify(_native_statement_json(statement), proof_bytes):
         raise ProofContractError("proof bytes failed native Halo2 verification")
 
-    if meta.get("statement_digest") != digest_hex(statement):
+    if meta.get("statement_digest") != statement["statement_digest"]:
         raise ProofContractError("metadata statement digest mismatch")
+    if meta.get("statement_file_digest") != digest_hex(statement):
+        raise ProofContractError("metadata statement file digest mismatch")
     if meta.get("proof_digest") != hashlib.sha256(proof_bytes).hexdigest():
         raise ProofContractError("metadata proof digest mismatch")
     if meta.get("vk_fingerprint") != statement["vk_fingerprint"]:
@@ -551,11 +709,16 @@ def verify_artifact_set(
 def verify_artifacts(
     proof_dir: str | os.PathLike[str],
     transcript: str | os.PathLike[str] | Iterable[Any],
+    expected_adapters: str
+    | os.PathLike[str]
+    | dict[str, Any]
+    | Iterable[dict[str, Any]],
 ) -> tuple[float, int]:
     import time
 
     start = time.time()
     entries = load_transcript(transcript)
+    adapter_index = load_expected_adapters(expected_adapters)
     statement_files = sorted(Path(proof_dir).glob("*.zklora.statement.json"))
     seen = set()
     for statement_file in statement_files:
@@ -568,7 +731,7 @@ def verify_artifacts(
         if key in seen:
             raise ProofContractError(f"duplicate proof statement for {key}")
         seen.add(key)
-        verify_artifact_set(statement_file, entries)
+        verify_artifact_set(statement_file, entries, adapter_index)
 
     expected = {entry.key() for entry in entries}
     if seen != expected:

@@ -12,6 +12,7 @@ from zklora.proof_contract import (
     InvocationWitness,
     ProofContractError,
     TranscriptEntry,
+    adapter_manifest_entry,
     compute_delta_quantized,
     flatten,
     load_json,
@@ -21,10 +22,27 @@ from zklora.proof_contract import (
     verify_artifacts,
     write_invocation_artifacts,
 )
+import zklora.proof_contract as proof_contract
+
+
+class FakeNative:
+    def adapter_commitment(self, adapter_json):
+        return str(abs(hash(adapter_json)))
+
+    def prove(self, statement_json, witness_json):
+        return f"{statement_json}|{witness_json}".encode()
+
+    def verify(self, statement_json, proof):
+        return proof.startswith(statement_json.encode() + b"|")
+
+
+@pytest.fixture(autouse=True)
+def fake_native(monkeypatch):
+    monkeypatch.setattr(proof_contract, "_native_module", lambda: FakeNative())
 
 
 def _valid_witness(session_id="s1", invocation_index=0):
-    fp = FixedPointConfig(scale_bits=20)
+    fp = FixedPointConfig(scale_bits=2, value_bits=16, intermediate_bits=32)
     a = quantize_nested([[2.0, -1.0]], fp)
     b = quantize_nested([[3.0], [-2.0]], fp)
     x = flatten(quantize_nested([1.5, -0.5], fp))
@@ -53,6 +71,19 @@ def _valid_witness(session_id="s1", invocation_index=0):
     )
 
 
+def _manifest_for(witness):
+    return [
+        adapter_manifest_entry(
+            witness.module_name,
+            witness.a,
+            witness.b,
+            witness.scaling_num,
+            witness.scaling_den,
+            witness.fixed_point,
+        )
+    ]
+
+
 def test_import_zklora_without_ezkl_or_onnx_side_effects():
     sys.modules.pop("zklora", None)
     module = importlib.import_module("zklora")
@@ -70,7 +101,9 @@ def test_statement_round_trip_is_canonical_and_transcript_bound(tmp_path):
     transcript_entry = transcript_entry_from_statement(statement)
 
     assert meta["proof_kind"] == "native-halo2"
-    total_time, count = verify_artifacts(tmp_path, [transcript_entry])
+    total_time, count = verify_artifacts(
+        tmp_path, [transcript_entry], _manifest_for(witness)
+    )
     assert total_time >= 0
     assert count == 1
 
@@ -102,7 +135,21 @@ def test_transcript_mismatch_rejects_even_with_valid_artifact(tmp_path):
     )
 
     with pytest.raises(ProofContractError, match="does not match verifier transcript"):
-        verify_artifacts(tmp_path, [mismatched])
+        verify_artifacts(tmp_path, [mismatched], _manifest_for(witness))
+
+
+def test_expected_adapter_manifest_mismatch_rejects(tmp_path):
+    witness = _valid_witness()
+    paths = write_invocation_artifacts(tmp_path, witness)
+    statement = load_json(paths["statement"])
+    transcript = [transcript_entry_from_statement(statement)]
+    manifest = _manifest_for(witness)
+    manifest[0]["adapter_commitment"]["value"] = str(
+        int(manifest[0]["adapter_commitment"]["value"]) + 1
+    )
+
+    with pytest.raises(ProofContractError, match="expected adapter manifest"):
+        verify_artifacts(tmp_path, transcript, manifest)
 
 
 def test_tampered_vk_and_proof_reject(tmp_path):
@@ -118,23 +165,26 @@ def test_tampered_vk_and_proof_reject(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(ProofContractError, match="fingerprint"):
-        verify_artifacts(tmp_path, transcript)
+        verify_artifacts(tmp_path, transcript, _manifest_for(witness))
 
     write_invocation_artifacts(tmp_path, witness)
     Path(paths["proof"]).write_bytes(b"tampered")
     with pytest.raises(ProofContractError, match="proof bytes"):
-        verify_artifacts(tmp_path, transcript)
+        verify_artifacts(tmp_path, transcript, _manifest_for(witness))
 
     paths = write_invocation_artifacts(tmp_path, witness)
     statement = load_json(paths["statement"])
-    statement["native_lora_commitment"]["value"] += 1
+    statement["adapter_commitment"]["value"] = str(
+        int(statement["adapter_commitment"]["value"]) + 1
+    )
+    statement["statement_digest"] = "00" * 32
     Path(paths["statement"]).write_text(
         json.dumps(statement, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
     transcript = [transcript_entry_from_statement(statement)]
-    with pytest.raises(ProofContractError, match="proof bytes"):
-        verify_artifacts(tmp_path, transcript)
+    with pytest.raises(ProofContractError, match="statement digest"):
+        verify_artifacts(tmp_path, transcript, _manifest_for(witness))
 
 
 def test_statement_binding_tampering_rejects(tmp_path):
@@ -148,8 +198,8 @@ def test_statement_binding_tampering_rejects(tmp_path):
         encoding="utf-8",
     )
     transcript = [transcript_entry_from_statement(statement)]
-    with pytest.raises(ProofContractError, match="circuit_id"):
-        verify_artifacts(tmp_path, transcript)
+    with pytest.raises(ProofContractError, match="statement digest"):
+        verify_artifacts(tmp_path, transcript, _manifest_for(witness))
 
     paths = write_invocation_artifacts(tmp_path, witness)
     statement = load_json(paths["statement"])
@@ -159,8 +209,8 @@ def test_statement_binding_tampering_rejects(tmp_path):
         encoding="utf-8",
     )
     transcript = [transcript_entry_from_statement(statement)]
-    with pytest.raises(ProofContractError, match="proof bytes"):
-        verify_artifacts(tmp_path, transcript)
+    with pytest.raises(ProofContractError, match="statement digest"):
+        verify_artifacts(tmp_path, transcript, _manifest_for(witness))
 
 
 def test_missing_or_tampered_invocation_rejects_whole_session(tmp_path):
@@ -173,11 +223,12 @@ def test_missing_or_tampered_invocation_rejects_whole_session(tmp_path):
         transcript_entry_from_statement(load_json(second_paths["statement"])),
     ]
 
-    verify_artifacts(tmp_path, transcript)
+    manifest = _manifest_for(first)
+    verify_artifacts(tmp_path, transcript, manifest)
 
     Path(second_paths["statement"]).unlink()
     with pytest.raises(ProofContractError, match="coverage mismatch"):
-        verify_artifacts(tmp_path, transcript)
+        verify_artifacts(tmp_path, transcript, manifest)
 
 
 def test_delta_relation_and_alpha_over_rank_scaling():

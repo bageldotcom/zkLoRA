@@ -9,10 +9,17 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []
-python = ["dep:pyo3", "pyo3/extension-module"]
+python = ["dep:pyo3"]
+extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 halo2_proofs = "0.3.2"
+halo2_gadgets = "0.4"
+halo2_poseidon = "0.1"
+ff = "0.13"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
 pyo3 = { version = "0.28.3", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }

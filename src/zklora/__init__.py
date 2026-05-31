@@ -11,6 +11,8 @@ _LAZY_EXPORTS = {
     "LoRAServerSocket": ("zklora.lora_contributor_mpi", "LoRAServerSocket"),
     "batch_verify_proofs": ("zklora.zk_proof_generator", "batch_verify_proofs"),
     "generate_proofs": ("zklora.zk_proof_generator", "generate_proofs"),
+    "adapter_manifest_entry": ("zklora.proof_contract", "adapter_manifest_entry"),
+    "write_adapter_manifest": ("zklora.proof_contract", "write_adapter_manifest"),
     "commit_activations": ("zklora.polynomial_commit", "commit_activations"),
     "verify_commitment": ("zklora.polynomial_commit", "verify_commitment"),
 }

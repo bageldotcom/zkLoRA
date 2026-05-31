@@ -1,6 +1,5 @@
 import socket
 import threading
-import pickle
 import os
 import math
 from fractions import Fraction
@@ -10,12 +9,15 @@ from transformers import AutoModelForCausalLM
 from peft import PeftModel
 
 from ..zk_proof_generator import generate_proofs
+from ..base_model_user_mpi import _recv_json_message, _send_json_message
 from ..proof_contract import (
     FixedPointConfig,
     InvocationWitness,
+    adapter_manifest_entry,
     compute_delta_quantized,
     flatten,
     quantize_nested,
+    write_adapter_manifest,
 )
 
 
@@ -74,9 +76,37 @@ class LoRAServer:
         self.session_data: dict[str, list[InvocationWitness]] = {}
         self._invocation_counts: dict[tuple[str, str], int] = {}
         self.last_scaling: tuple[int, int] = (1, 1)
+        self.last_q_delta: list[list[int]] = []
 
     def list_lora_injection_points(self):
         return list(self.submodules.keys())
+
+    def adapter_manifest_entries(self):
+        entries = []
+        for sub_name, module in self.submodules.items():
+            a_matrix, b_matrix, scaling_num, scaling_den = lora_matrices_and_scaling(
+                module
+            )
+            a_quantized = quantize_nested(
+                a_matrix.detach().cpu().numpy().tolist(), self.fixed_point
+            )
+            b_quantized = quantize_nested(
+                b_matrix.detach().cpu().numpy().tolist(), self.fixed_point
+            )
+            entries.append(
+                adapter_manifest_entry(
+                    sub_name,
+                    a_quantized,
+                    b_quantized,
+                    scaling_num,
+                    scaling_den,
+                    self.fixed_point,
+                )
+            )
+        return entries
+
+    def write_adapter_manifest(self, path: str):
+        write_adapter_manifest(path, self.adapter_manifest_entries())
 
     def apply_lora(
         self,
@@ -93,6 +123,7 @@ class LoRAServer:
                 compute_lora_delta(mod, input_tensor)
             )
         self.last_scaling = (int(scaling_num), int(scaling_den))
+        self.last_q_delta = []
 
         sid = session_id or "default-session"
         key = (sid, sub_name)
@@ -116,7 +147,7 @@ class LoRAServer:
                 scaling_den,
                 self.fixed_point,
             )
-            delta_rows.append(q_delta)
+            delta_rows.append([int(v) for v in q_delta])
             invocation_index = self._invocation_counts.get(key, 0)
             self._invocation_counts[key] = invocation_index + 1
             witness = InvocationWitness(
@@ -140,6 +171,7 @@ class LoRAServer:
                 fixed_point=self.fixed_point,
             )
             self.session_data.setdefault(sid, []).append(witness)
+        self.last_q_delta = [row[:] for row in delta_rows]
         quantized_delta = torch.tensor(delta_rows, dtype=torch.float64) / float(
             self.fixed_point.scale
         )
@@ -189,8 +221,6 @@ class LoRAServerSocket(threading.Thread):
         self.stop_timeout = stop_timeout
 
     def run(self):
-        import socket
-
         print(f"[A-Server] listening on {self.host}:{self.port}")
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.bind((self.host, self.port))
@@ -213,10 +243,9 @@ class LoRAServerSocket(threading.Thread):
 
     def handle_conn(self, conn, addr):
         try:
-            data = self.recv_all(conn)
-            if not data:
+            req = self.recv_message(conn)
+            if req is None:
                 return
-            req = pickle.loads(data)
             rtype = req.get("request_type", "lora_forward")
 
             if rtype == "init_request":
@@ -232,6 +261,7 @@ class LoRAServerSocket(threading.Thread):
                 resp = {
                     "response_type": "lora_forward_response",
                     "output_array": out.cpu().numpy(),
+                    "q_delta": self.lora_server.last_q_delta,
                     "scaling_num": int(self.lora_server.last_scaling[0]),
                     "scaling_den": int(self.lora_server.last_scaling[1]),
                 }
@@ -248,29 +278,29 @@ class LoRAServerSocket(threading.Thread):
             else:
                 resp = {"error": f"Unknown request_type {rtype}"}
 
-            conn.sendall(pickle.dumps(resp))
+            _send_json_message(conn, resp)
         except Exception as e:
             print(f"[A-Server] error: {e}")
         finally:
             conn.close()
 
-    def recv_all(self, conn, chunk_size=4096):
-        buffer = b""
+    def recv_message(self, conn):
         conn.settimeout(1200.0)
-        while True:
-            try:
-                chunk = conn.recv(chunk_size)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            buffer += chunk
-        return buffer
+        return _recv_json_message(conn)
 
 
 def compute_lora_delta(module, input_tensor: torch.Tensor):
     """Return the canonical LoRA delta and matrices for a PEFT linear LoRA module."""
 
+    a_matrix, b_matrix, scaling_num, scaling_den = lora_matrices_and_scaling(module)
+    scaling = scaling_num / scaling_den
+
+    x = input_tensor.float()
+    delta = torch.matmul(torch.matmul(x, a_matrix.t()), b_matrix.t()) * scaling
+    return delta, a_matrix, b_matrix, scaling_num, scaling_den
+
+
+def lora_matrices_and_scaling(module):
     if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
         raise ValueError("module does not expose lora_A/lora_B")
 
@@ -285,11 +315,7 @@ def compute_lora_delta(module, input_tensor: torch.Tensor):
     b_matrix = b_mod.weight.detach().cpu().float()
 
     scaling_num, scaling_den = scaling_rational(module, adapter, int(a_matrix.shape[0]))
-    scaling = scaling_num / scaling_den
-
-    x = input_tensor.float()
-    delta = torch.matmul(torch.matmul(x, a_matrix.t()), b_matrix.t()) * scaling
-    return delta, a_matrix, b_matrix, scaling_num, scaling_den
+    return a_matrix, b_matrix, scaling_num, scaling_den
 
 
 def scaling_rational(module, adapter: str, rank: int) -> tuple[int, int]:
