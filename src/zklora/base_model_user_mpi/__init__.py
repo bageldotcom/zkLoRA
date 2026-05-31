@@ -1,4 +1,5 @@
 import json
+import math
 import socket
 import uuid
 from typing import Any
@@ -168,14 +169,33 @@ class RemoteLoRAWrappedModule(nn.Module):
             scaling_den = (
                 self.transcript_recorder.scaling_den if self.transcript_recorder else 1
             )
-        if remote_out is None:
-            raise RuntimeError(f"[B] submodule '{self.sub_name}' => no output from A.")
-        out_t = torch.tensor(remote_out, dtype=torch.float32)
+        if q_delta is not None and self.transcript_recorder is not None:
+            out_t = _dequantize_q_delta(
+                q_delta,
+                self.transcript_recorder.fixed_point,
+                tuple(base_out.shape),
+                base_out.device,
+                base_out.dtype if torch.is_floating_point(base_out) else torch.float32,
+            )
+            remote_out_for_record = out_t.detach().cpu().numpy()
+        elif self.transcript_recorder is not None:
+            raise RuntimeError(
+                f"[B] submodule '{self.sub_name}' => proof-bound response missing q_delta."
+            )
+        else:
+            if remote_out is None:
+                raise RuntimeError(
+                    f"[B] submodule '{self.sub_name}' => no output from A."
+                )
+            out_t = torch.tensor(
+                remote_out, dtype=torch.float32, device=base_out.device
+            )
+            remote_out_for_record = remote_out
         if self.transcript_recorder is not None:
             self.transcript_recorder.record(
                 self.sub_name,
                 arr,
-                remote_out,
+                remote_out_for_record,
                 scaling_num=scaling_num,
                 scaling_den=scaling_den,
                 q_delta_values=q_delta,
@@ -275,7 +295,9 @@ def _canonical_rows(values):
 
 
 def _canonical_int_rows(values):
-    tensor = torch.as_tensor(_to_list(values), dtype=torch.int64)
+    values = _to_list(values)
+    _assert_exact_int_values(values)
+    tensor = torch.as_tensor(values, dtype=torch.int64)
     if tensor.numel() == 0:
         return []
     if tensor.ndim == 0:
@@ -286,6 +308,49 @@ def _canonical_int_rows(values):
         [int(v) for v in row]
         for row in tensor.reshape(-1, tensor.shape[-1]).cpu().numpy().tolist()
     ]
+
+
+def _assert_exact_int_values(values):
+    if isinstance(values, bool):
+        raise ValueError("q_delta values must be integers, not booleans")
+    if isinstance(values, int):
+        return
+    if isinstance(values, (list, tuple)):
+        for value in values:
+            _assert_exact_int_values(value)
+        return
+    raise ValueError(f"q_delta values must be integers, got {type(values).__name__}")
+
+
+def _dequantize_q_delta(
+    q_delta_values,
+    fixed_point: FixedPointConfig,
+    target_shape: tuple[int, ...],
+    device,
+    dtype,
+):
+    q_delta_rows = _canonical_int_rows(q_delta_values)
+    if not q_delta_rows:
+        raise RuntimeError("Received empty q_delta for proof-bound LoRA response.")
+    q_delta = torch.tensor(q_delta_rows, dtype=torch.float64)
+    expected_rows = math.prod(target_shape[:-1]) if target_shape else 1
+    expected_cols = target_shape[-1] if target_shape else 1
+    if list(q_delta.shape) != [expected_rows, expected_cols]:
+        raise RuntimeError(
+            "q_delta shape does not match local module output rows: "
+            f"{list(q_delta.shape)} != {[expected_rows, expected_cols]}"
+        )
+    expected = math.prod(target_shape)
+    if q_delta.numel() != expected:
+        raise RuntimeError(
+            "q_delta shape does not match local module output: "
+            f"{list(q_delta.shape)} cannot reshape to {list(target_shape)}"
+        )
+    return (
+        (q_delta / float(fixed_point.scale))
+        .reshape(target_shape)
+        .to(device=device, dtype=dtype)
+    )
 
 
 class BaseModelClient:

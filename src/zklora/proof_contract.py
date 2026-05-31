@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -424,11 +425,19 @@ def _native_witness_json(witness: InvocationWitness) -> str:
 
 def _native_module():
     try:
-        from zklora import _native_prover  # type: ignore
-
-        return _native_prover
-    except Exception:
-        return None
+        return importlib.import_module("zklora._native_prover")
+    except ModuleNotFoundError as exc:
+        if exc.name == "zklora._native_prover":
+            return None
+        raise
+    except ImportError as exc:
+        raise ProofContractError(
+            f"failed to import native Halo2 prover: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise ProofContractError(
+            f"failed to import native Halo2 prover: {exc}"
+        ) from exc
 
 
 def write_invocation_artifacts(

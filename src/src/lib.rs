@@ -26,6 +26,8 @@ use std::convert::TryInto;
 
 const ADAPTER_COMMITMENT_DOMAIN: u64 = 0x5a4b4c4f5241; // "ZKLORA"
 const ADAPTER_COMMITMENT_VERSION: u64 = 1;
+// Must match proof_contract.SCHEMA_VERSION; it is hashed into adapter commitments.
+const ARTIFACT_SCHEMA_VERSION: u64 = 2;
 const FIELD_SAFE_BITS: usize = 250;
 const POSEIDON_PAIR_ROWS: usize = 96;
 
@@ -282,7 +284,7 @@ impl Circuit<Fp> for LoraCircuit {
                     &config,
                     &mut adapter_words,
                     &mut offset,
-                    BigInt::from(2u64),
+                    BigInt::from(ARTIFACT_SCHEMA_VERSION),
                     "adapter schema version",
                 )?;
                 for (label, value) in [
@@ -1371,6 +1373,35 @@ mod tests {
         }
     }
 
+    fn minimal_circuit() -> LoraCircuit {
+        let input = AdapterCommitmentInput {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            in_dim: 1,
+            rank: 1,
+            out_dim: 1,
+            fixed_point: FixedPointConfig {
+                scale_bits: 0,
+                value_bits: 3,
+                intermediate_bits: 4,
+            },
+            scaling_num: 1,
+            scaling_den: 1,
+            a: vec![vec![1]],
+            b: vec![vec![1]],
+        };
+        LoraCircuit {
+            a: input.a.clone(),
+            b: input.b.clone(),
+            x: vec![1],
+            delta: vec![1],
+            fixed_point: input.fixed_point.clone(),
+            scaling_num: input.scaling_num,
+            scaling_den: input.scaling_den,
+            adapter_commitment: adapter_commitment_for_input(&input).unwrap(),
+            statement_digest: "22".repeat(32),
+        }
+    }
+
     #[test]
     fn poseidon_adapter_commitment_is_deterministic() {
         let input = adapter_input();
@@ -1409,7 +1440,7 @@ mod tests {
     #[test]
     #[ignore = "IPA proof generation for the Poseidon/range-check circuit is intentionally slow"]
     fn real_proof_verifies_for_tiny_relation() {
-        let circuit = valid_circuit();
+        let circuit = minimal_circuit();
         let statement = NativeStatement {
             x: circuit.x.clone(),
             delta: circuit.delta.clone(),

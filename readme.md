@@ -32,6 +32,8 @@ To solve this, we created **ZKLoRA** a zero-knowledge verification protocol that
 
 This implementation uses a native Halo2 backend for transcript-bound proof artifacts. The v2 proof contract verifies exact quantized LoRA delta correctness for the statement the base user actually sent and received, and binds the proof to a pre-inference adapter manifest. It does not claim an end-to-end proof that the base model computed those activations.
 
+Verifier trust boundary: `expected_adapters` must be obtained and pinned by the verifier out-of-band before inference starts, for example by recording the exact manifest file or digest. A contributor-generated adapter manifest is only a convenience handoff artifact; if it is first generated after inference or supplied only alongside proofs, it is not trusted verifier input.
+
 For detailed information about this research, please refer to [our paper](https://arxiv.org/abs/2501.13965).
 
 <h2 align="center">Quick Usage Instructions</h2>
@@ -45,7 +47,7 @@ pip install zklora
 
 Use `src/scripts/lora_contributor_sample_script.py` to:
 - Host LoRA submodules
-- Write a pre-inference adapter manifest
+- Write a pre-inference adapter manifest for the verifier to pin out-of-band
 - Handle inference requests
 - Generate proof artifacts
 
@@ -57,18 +59,36 @@ import time
 from zklora import LoRAServer, LoRAServerSocket
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a sample LoRA contributor server and write the adapter manifest "
+            "that the verifier should pin out-of-band before inference."
+        )
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port_a", type=int, default=30000)
     parser.add_argument("--base_model", default="distilgpt2")
     parser.add_argument("--lora_model_id", default="ng0-k1/distilgpt2-finetuned-es")
     parser.add_argument("--out_dir", default="a-out")
-    parser.add_argument("--adapter_manifest", default="adapter-manifest.json")
+    parser.add_argument(
+        "--adapter_manifest",
+        default="adapter-manifest.json",
+        help=(
+            "Convenience manifest handoff path. The verifier must obtain and pin "
+            "this manifest out-of-band before inference; a post-inference manifest "
+            "is not trusted expected_adapters input."
+        ),
+    )
     args = parser.parse_args()
 
     stop_event = threading.Event()
     server_obj = LoRAServer(args.base_model, args.lora_model_id, args.out_dir)
     server_obj.write_adapter_manifest(args.adapter_manifest)
+    print(f"[A-Server] wrote adapter manifest => {args.adapter_manifest}")
+    print(
+        "[A-Server] verifier must pin this manifest out-of-band before inference; "
+        "post-inference manifests are not trusted expected_adapters."
+    )
     t = LoRAServerSocket(args.host, args.port_a, server_obj, stop_event)
     t.start()
 
@@ -141,6 +161,8 @@ if __name__=="__main__":
 
 Use `src/scripts/verify_proofs.py` to validate the proof artifacts:
 
+`--expected_adapters` must point to the verifier's pinned pre-inference adapter manifest. Do not accept a contributor manifest that was generated after inference, or first delivered with the proof bundle, as trusted verifier input; it is useful only as a handoff artifact to compare against the pinned expectation.
+
 ```python
 #!/usr/bin/env python3
 """
@@ -173,7 +195,10 @@ def main():
         "--expected_adapters",
         type=str,
         required=True,
-        help="Pre-inference adapter manifest JSON agreed by the verifier."
+        help=(
+            "Verifier-pinned pre-inference adapter manifest JSON. This must be "
+            "obtained out-of-band before inference, not first supplied with proofs."
+        )
     )
     parser.add_argument(
         "--verbose",

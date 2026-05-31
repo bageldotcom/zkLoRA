@@ -28,9 +28,11 @@ src/
 The zero-knowledge proof system in ZKLoRA is built on transcript-bound LoRA delta statements and native Halo2 proofs. The `zk_proof_generator.py` module orchestrates the proof generation process by:
 
 1. Capturing the base user's local transcript of activations and returned LoRA deltas
-2. Binding each proof to a pre-inference adapter manifest with a Poseidon adapter commitment
+2. Binding each proof to a verifier-pinned pre-inference adapter manifest with a Poseidon adapter commitment
 3. Generating native `.zklora.*` proof artifacts for contributor-side LoRA invocations
 4. Verifying proof artifacts against both the base user's transcript and expected adapter manifest before accepting a module
+
+The verifier must obtain and pin `expected_adapters` out-of-band before inference starts. Contributor-generated adapter manifests are convenience handoff artifacts only; if a manifest is generated after inference or first delivered alongside proofs, it is not trusted to define the expected adapter.
 
 ### Multi-Party Inference Protocol
 
@@ -112,5 +114,7 @@ verify_time, num_proofs = batch_verify_proofs(
     expected_adapters="adapter-manifest.json",
 )
 ```
+
+In this example, `adapter-manifest.json` is the verifier's pre-inference pinned copy or digest-matched file, not a manifest first generated after inference.
 
 For detailed implementation information, please refer to the individual module documentation. 

@@ -18,6 +18,7 @@ from zklora.base_model_user_mpi import (  # noqa: E402
     ProofTranscriptRecorder,
     RemoteLoRAWrappedModule,
 )
+from zklora.proof_contract import FixedPointConfig  # noqa: E402
 
 
 def _read_exact(conn, size):
@@ -98,11 +99,21 @@ class MetadataComm(BaseModelToLoRAComm):
 
 
 class QuantizedMetadataComm(MetadataComm):
+    def __init__(self, q_delta=None, output_offset=2):
+        super().__init__()
+        self.q_delta = q_delta
+        self.output_offset = output_offset
+
     def lora_forward(self, sub_name, arr, session_id=None, include_metadata=False):
         resp = super().lora_forward(
             sub_name, arr, session_id=session_id, include_metadata=include_metadata
         )
-        resp["q_delta"] = [[101, -202], [303, -404]]
+        resp["output_array"] = arr + self.output_offset
+        resp["q_delta"] = (
+            self.q_delta
+            if self.q_delta is not None
+            else (torch.as_tensor(arr, dtype=torch.int64) + 2).tolist()
+        )
         return resp
 
 
@@ -130,11 +141,14 @@ def test_multi_contributor_patch():
 
 
 def test_remote_module_records_per_vector_transcript_with_scaling():
-    recorder = ProofTranscriptRecorder(session_id="s1")
+    recorder = ProofTranscriptRecorder(
+        session_id="s1",
+        fixed_point=FixedPointConfig(scale_bits=0, value_bits=16, intermediate_bits=32),
+    )
     wrapped = RemoteLoRAWrappedModule(
         "sub1",
         DummySub(),
-        MetadataComm(),
+        QuantizedMetadataComm(),
         combine_mode="add_delta",
         transcript_recorder=recorder,
     )
@@ -209,20 +223,61 @@ def test_base_comm_uses_length_prefixed_json_protocol():
 
 
 def test_remote_module_records_transported_q_delta_exactly():
-    recorder = ProofTranscriptRecorder(session_id="s1")
+    q_delta = [[2**52 + 101, -(2**52 + 202)], [303, -404]]
+    recorder = ProofTranscriptRecorder(
+        session_id="s1",
+        fixed_point=FixedPointConfig(
+            scale_bits=0, value_bits=63, intermediate_bits=127
+        ),
+    )
     wrapped = RemoteLoRAWrappedModule(
         "sub1",
         DummySub(),
-        QuantizedMetadataComm(),
+        QuantizedMetadataComm(q_delta=q_delta, output_offset=999),
         transcript_recorder=recorder,
     )
 
     x = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
     out = wrapped(x)
 
-    assert torch.equal(out, x + 2)
-    assert [entry.delta for entry in recorder.entries] == [[101, -202], [303, -404]]
+    assert torch.equal(out, torch.tensor(q_delta, dtype=torch.float32).reshape_as(x))
+    assert [entry.delta for entry in recorder.entries] == q_delta
     assert [entry.output_shape for entry in recorder.entries] == [[2], [2]]
+
+
+def test_remote_module_requires_q_delta_for_proof_bound_forward():
+    recorder = ProofTranscriptRecorder(session_id="s1")
+    wrapped = RemoteLoRAWrappedModule(
+        "sub1",
+        DummySub(),
+        MetadataComm(),
+        transcript_recorder=recorder,
+    )
+
+    with pytest.raises(RuntimeError, match="missing q_delta"):
+        wrapped(torch.tensor([[1.0, 2.0]]))
+
+
+def test_remote_module_rejects_malformed_q_delta_before_recording():
+    recorder = ProofTranscriptRecorder(
+        session_id="s1",
+        fixed_point=FixedPointConfig(scale_bits=0, value_bits=16, intermediate_bits=32),
+    )
+    wrapped = RemoteLoRAWrappedModule(
+        "sub1",
+        DummySub(),
+        QuantizedMetadataComm(q_delta=[[1, 2, 3]]),
+        transcript_recorder=recorder,
+    )
+
+    with pytest.raises(RuntimeError, match="q_delta shape"):
+        wrapped(torch.tensor([[1.0, 2.0]]))
+    assert recorder.entries == []
+
+    wrapped.comm = QuantizedMetadataComm(q_delta=[[1.0, 2.0]])
+    with pytest.raises(ValueError, match="q_delta values must be integers"):
+        wrapped(torch.tensor([[1.0, 2.0]]))
+    assert recorder.entries == []
 
 
 def test_lora_server_socket_returns_json_q_delta():
