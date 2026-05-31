@@ -28,7 +28,9 @@ Low-Rank Adaptation (LoRA) is a widely adopted method for customizing large-scal
 1. **Base Model User Verification**: The user must confirm that the LoRA weights are effective when paired with the intended base model.
 2. **LoRA Contributor Protection**: The contributor must keep their proprietary LoRA weights private until compensation is assured.
 
-To solve this, we created **ZKLoRA** a zero-knowledge verification protocol that relies on polynomial commitments, succinct proofs, and multi-party inference to verify LoRA–base model compatibility without exposing LoRA weights. With ZKLoRA, verification of LoRA modules takes just 1-2 seconds, even for state-of-the-art language models with tens of billions of parameters.
+To solve this, we created **ZKLoRA** a zero-knowledge verification protocol that relies on polynomial commitments, succinct proofs, and multi-party inference to verify LoRA–base model compatibility without exposing LoRA weights.
+
+This implementation uses a native Halo2 backend for transcript-bound proof artifacts. The v1 proof contract verifies exact quantized LoRA delta correctness for the statement the base user actually sent and received; it does not claim an end-to-end proof that the base model computed those activations.
 
 For detailed information about this research, please refer to [our paper](https://arxiv.org/abs/2501.13965).
 
@@ -51,7 +53,7 @@ import argparse
 import threading
 import time
 
-from zklora import LoRAServer, AServerTCP
+from zklora import LoRAServer, LoRAServerSocket
 
 def main():
     parser = argparse.ArgumentParser()
@@ -64,7 +66,7 @@ def main():
 
     stop_event = threading.Event()
     server_obj = LoRAServer(args.base_model, args.lora_model_id, args.out_dir)
-    t = AServerTCP(args.host, args.port_a, server_obj, stop_event)
+    t = LoRAServerSocket(args.host, args.port_a, server_obj, stop_event)
     t.start()
 
     try:
@@ -123,9 +125,10 @@ def main():
     loss_val = client.forward_loss(text)
     print(f"[B] final loss => {loss_val:.4f}")
 
-    # End inference => A finalizes proofs offline
+    # End inference => A finalizes native ZKLoRA proof artifacts
     client.end_inference()
-    print("[B] done. B can now fetch proof files from A and verify them offline.")
+    client.transcript.write("b-transcript.json")
+    print("[B] done. B can now fetch proof files from A and verify them against b-transcript.json.")
 
 if __name__=="__main__":
     main()
@@ -141,7 +144,7 @@ Use `src/scripts/verify_proofs.py` to validate the proof artifacts:
 Verify LoRA proof artifacts in a given directory.
 
 Example usage:
-  python verify_proofs.py --proof_dir a-out --verbose
+  python verify_proofs.py --proof_dir a-out --transcript b-transcript.json --verbose
 """
 
 import argparse
@@ -155,7 +158,13 @@ def main():
         "--proof_dir",
         type=str,
         default="proof_artifacts",
-        help="Directory containing proof files (.pf), plus settings, vk, srs."
+        help="Directory containing native .zklora proof artifacts."
+    )
+    parser.add_argument(
+        "--transcript",
+        type=str,
+        required=True,
+        help="Base user transcript JSON captured during inference."
     )
     parser.add_argument(
         "--verbose",
@@ -166,6 +175,7 @@ def main():
 
     total_verify_time, num_proofs = batch_verify_proofs(
         proof_dir=args.proof_dir,
+        transcript=args.transcript,
         verbose=args.verbose
     )
     print(f"Done verifying {num_proofs} proofs. Total time: {total_verify_time:.2f}s")
@@ -328,8 +338,7 @@ ZKLoRA is built upon these outstanding open source projects:
 | [Transformers](https://github.com/huggingface/transformers) | State-of-the-art Natural Language Processing |
 | [dusk-merkle](https://github.com/dusk-network/dusk-merkle) | Merkle tree implementation in Rust |
 | [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) | Cryptographic hash function |
-| [EZKL](https://github.com/zkonduit/ezkl) | Zero-knowledge proof system for neural networks |
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Cross-platform ML model inference |
+| [Halo2](https://github.com/zcash/halo2) | Native zero-knowledge proving system used by the ZKLoRA backend |
 
 <hr>
 

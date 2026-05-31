@@ -32,7 +32,7 @@ def main():
     )
     client.init_and_patch()
 
-    # forward pass => triggers submodule calls => A accumulates => .onnx => proofs
+    # forward pass => triggers submodule calls => A records transcript-bound proof inputs
     text = "Hello World, this is a LoRA test."
 
     loss_val = client.forward_loss(text)

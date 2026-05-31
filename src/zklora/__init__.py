@@ -1,17 +1,31 @@
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
-from .zk_proof_generator import batch_verify_proofs
-from .lora_contributor_mpi import LoRAServer, LoRAServerSocket
-from .base_model_user_mpi import BaseModelClient
-from .polynomial_commit import commit_activations, verify_commitment
+_LAZY_EXPORTS = {
+    "BaseModelClient": ("zklora.base_model_user_mpi", "BaseModelClient"),
+    "BaseModelToLoRAComm": ("zklora.base_model_user_mpi", "BaseModelToLoRAComm"),
+    "RemoteLoRAWrappedModule": (
+        "zklora.base_model_user_mpi",
+        "RemoteLoRAWrappedModule",
+    ),
+    "LoRAServer": ("zklora.lora_contributor_mpi", "LoRAServer"),
+    "LoRAServerSocket": ("zklora.lora_contributor_mpi", "LoRAServerSocket"),
+    "batch_verify_proofs": ("zklora.zk_proof_generator", "batch_verify_proofs"),
+    "generate_proofs": ("zklora.zk_proof_generator", "generate_proofs"),
+    "commit_activations": ("zklora.polynomial_commit", "commit_activations"),
+    "verify_commitment": ("zklora.polynomial_commit", "verify_commitment"),
+}
+
+__all__ = [*_LAZY_EXPORTS, "__version__"]
 
 
-__all__ = [
-    "batch_verify_proofs",
-    "LoRAServer",
-    "LoRAServerSocket",
-    "BaseModelClient",
-    "commit_activations",
-    "verify_commitment",
-    "__version__",
-]
+def __getattr__(name):
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module 'zklora' has no attribute {name!r}")
+
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    from importlib import import_module
+
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

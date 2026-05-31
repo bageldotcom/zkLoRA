@@ -2,15 +2,21 @@ import socket
 import threading
 import pickle
 import os
-import asyncio
+import math
+from fractions import Fraction
 
 import torch
 from transformers import AutoModelForCausalLM
 from peft import PeftModel
 
-# from zklora with the MPI exporter & proof generator
 from ..zk_proof_generator import generate_proofs
-from ..mpi_lora_onnx_exporter import export_lora_onnx_json_mpi
+from ..proof_contract import (
+    FixedPointConfig,
+    InvocationWitness,
+    compute_delta_quantized,
+    flatten,
+    quantize_nested,
+)
 
 
 def read_file_as_bytes(path: str) -> bytes:
@@ -32,8 +38,15 @@ def strip_prefix(raw_name: str) -> str:
 
 
 class LoRAServer:
-    def __init__(self, base_model_name: str, lora_model_id: str, out_dir: str):
+    def __init__(
+        self,
+        base_model_name: str,
+        lora_model_id: str,
+        out_dir: str,
+        fixed_point: FixedPointConfig | None = None,
+    ):
         self.out_dir = out_dir
+        self.fixed_point = fixed_point or FixedPointConfig()
         os.makedirs(self.out_dir, exist_ok=True)
 
         # 1) Load model, disable cache => no 'past_key_values'
@@ -58,52 +71,97 @@ class LoRAServer:
                     continue
                 self.submodules[sname] = module
 
-        self.session_data = {}  # {sub_name => [np arrays]}
+        self.session_data: dict[str, list[InvocationWitness]] = {}
+        self._invocation_counts: dict[tuple[str, str], int] = {}
+        self.last_scaling: tuple[int, int] = (1, 1)
 
     def list_lora_injection_points(self):
         return list(self.submodules.keys())
 
-    def apply_lora(self, sub_name: str, input_tensor: torch.Tensor):
+    def apply_lora(
+        self,
+        sub_name: str,
+        input_tensor: torch.Tensor,
+        session_id: str | None = None,
+    ):
         if sub_name not in self.submodules:
             raise ValueError(f"[LoRAServer] submodule '{sub_name}' not recognized.")
         mod = self.submodules[sub_name]
         print(f"[A] apply_lora on '{sub_name}', shape={list(input_tensor.shape)}")
         with torch.no_grad():
-            out = mod(input_tensor)
-        x_np = input_tensor.cpu().numpy()
-        self.session_data.setdefault(sub_name, []).append(x_np)
-        return out
-
-    def finalize_proofs_and_collect(self):
-        """
-        Exports ONNX + JSON for each submodule used, then runs proofs, reads .pf + .vk, etc.
-        """
-        print(f"[A] finalize_proofs_and_collect => exporting => {self.out_dir}")
-        for sname, arr_list in self.session_data.items():
-            if not arr_list:
-                continue
-            last_in = arr_list[-1]
-            mod = self.submodules[sname]
-            export_lora_onnx_json_mpi(
-                sub_name=sname,
-                x_data=last_in,
-                submodule=mod,
-                output_dir=self.out_dir,
-                verbose=True,
+            delta_float, a_matrix, b_matrix, scaling_num, scaling_den = (
+                compute_lora_delta(mod, input_tensor)
             )
-        self.session_data.clear()
+        self.last_scaling = (int(scaling_num), int(scaling_den))
 
-        # generate proofs synchronously
-        print(
-            "[A] Running generate_proofs(...) via asyncio.run(...) in the same thread."
+        sid = session_id or "default-session"
+        key = (sid, sub_name)
+        x_rows = input_tensor.detach().cpu().float().reshape(-1, int(a_matrix.shape[1]))
+        delta_rows = []
+        a_quantized = quantize_nested(
+            a_matrix.detach().cpu().numpy().tolist(), self.fixed_point
         )
-        proof_res = asyncio.run(
-            generate_proofs(
-                onnx_dir=self.out_dir,
-                json_dir=self.out_dir,
-                output_dir=self.out_dir,
-                verbose=True,
+        b_quantized = quantize_nested(
+            b_matrix.detach().cpu().numpy().tolist(), self.fixed_point
+        )
+        for x_row in x_rows:
+            q_x = flatten(
+                quantize_nested(x_row.cpu().numpy().tolist(), self.fixed_point)
             )
+            q_delta = compute_delta_quantized(
+                a_quantized,
+                b_quantized,
+                q_x,
+                scaling_num,
+                scaling_den,
+                self.fixed_point,
+            )
+            delta_rows.append(q_delta)
+            invocation_index = self._invocation_counts.get(key, 0)
+            self._invocation_counts[key] = invocation_index + 1
+            witness = InvocationWitness(
+                session_id=sid,
+                module_name=sub_name,
+                invocation_index=invocation_index,
+                input_shape=[int(a_matrix.shape[1])],
+                output_shape=[int(b_matrix.shape[0])],
+                x=q_x,
+                delta=q_delta,
+                a=a_quantized,
+                b=b_quantized,
+                scaling_num=scaling_num,
+                scaling_den=scaling_den,
+                adapter_metadata={
+                    "rank": int(a_matrix.shape[0]),
+                    "in_dim": int(a_matrix.shape[1]),
+                    "out_dim": int(b_matrix.shape[0]),
+                    "source": "peft-linear-lora",
+                },
+                fixed_point=self.fixed_point,
+            )
+            self.session_data.setdefault(sid, []).append(witness)
+        quantized_delta = torch.tensor(delta_rows, dtype=torch.float64) / float(
+            self.fixed_point.scale
+        )
+        return quantized_delta.reshape(delta_float.shape)
+
+    def finalize_proofs_and_collect(self, session_id: str | None = None):
+        """
+        Generates native ZKLoRA proof artifacts for captured LoRA invocations.
+        """
+        print(f"[A] finalize_proofs_and_collect => native artifacts => {self.out_dir}")
+        if session_id is None:
+            records = [
+                record for values in self.session_data.values() for record in values
+            ]
+            self.session_data.clear()
+        else:
+            records = self.session_data.pop(session_id, [])
+
+        proof_res = generate_proofs(
+            records=records,
+            output_dir=self.out_dir,
+            verbose=True,
         )
 
         if not proof_res:
@@ -168,19 +226,23 @@ class LoRAServerSocket(threading.Thread):
             elif rtype == "lora_forward":
                 sname = req["submodule_name"]
                 arr = req["input_array"]
+                session_id = req.get("session_id")
                 tin = torch.tensor(arr, dtype=torch.float32)
-                out = self.lora_server.apply_lora(sname, tin)
+                out = self.lora_server.apply_lora(sname, tin, session_id=session_id)
                 resp = {
                     "response_type": "lora_forward_response",
                     "output_array": out.cpu().numpy(),
+                    "scaling_num": int(self.lora_server.last_scaling[0]),
+                    "scaling_den": int(self.lora_server.last_scaling[1]),
                 }
 
             elif rtype == "end_inference":
-                # generate proofs locally
-                self.lora_server.finalize_proofs_and_collect()
+                self.lora_server.finalize_proofs_and_collect(
+                    session_id=req.get("session_id")
+                )
                 resp = {
                     "response_type": "end_inference_ack",
-                    "message": "A finished proof generation locally. B can close.",
+                    "message": "A finished native ZKLoRA proof generation locally.",
                 }
 
             else:
@@ -204,3 +266,50 @@ class LoRAServerSocket(threading.Thread):
                 break
             buffer += chunk
         return buffer
+
+
+def compute_lora_delta(module, input_tensor: torch.Tensor):
+    """Return the canonical LoRA delta and matrices for a PEFT linear LoRA module."""
+
+    if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+        raise ValueError("module does not expose lora_A/lora_B")
+
+    adapter_names = list(module.lora_A.keys()) if hasattr(module.lora_A, "keys") else []
+    if not adapter_names:
+        raise ValueError("module has no LoRA adapter weights")
+    adapter = adapter_names[0]
+
+    a_mod = module.lora_A[adapter]
+    b_mod = module.lora_B[adapter]
+    a_matrix = a_mod.weight.detach().cpu().float()
+    b_matrix = b_mod.weight.detach().cpu().float()
+
+    scaling_num, scaling_den = scaling_rational(module, adapter, int(a_matrix.shape[0]))
+    scaling = scaling_num / scaling_den
+
+    x = input_tensor.float()
+    delta = torch.matmul(torch.matmul(x, a_matrix.t()), b_matrix.t()) * scaling
+    return delta, a_matrix, b_matrix, scaling_num, scaling_den
+
+
+def scaling_rational(module, adapter: str, rank: int) -> tuple[int, int]:
+    if hasattr(module, "lora_alpha"):
+        alpha_source = module.lora_alpha
+        alpha = (
+            alpha_source.get(adapter, None)
+            if isinstance(alpha_source, dict)
+            else alpha_source
+        )
+        if alpha is not None:
+            numerator, denominator = int(alpha), int(rank)
+            divisor = math.gcd(numerator, denominator)
+            return numerator // divisor, denominator // divisor
+
+    scaling = 1.0
+    if hasattr(module, "scaling"):
+        if isinstance(module.scaling, dict):
+            scaling = float(module.scaling.get(adapter, 1.0))
+        else:
+            scaling = float(module.scaling)
+    fraction = Fraction(str(scaling)).limit_denominator()
+    return fraction.numerator, fraction.denominator

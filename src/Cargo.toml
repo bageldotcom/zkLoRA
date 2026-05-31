@@ -1,0 +1,24 @@
+[package]
+name = "zklora-native-prover"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "_native_prover"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python = ["dep:pyo3", "pyo3/extension-module"]
+
+[dependencies]
+halo2_proofs = "0.3.2"
+pyo3 = { version = "0.28.3", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

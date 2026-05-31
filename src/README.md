@@ -13,8 +13,9 @@ src/
 │   ├── lora_contributor_mpi/   # Server implementation (User A)
 │   ├── libs/
 │   │   └── merkle/            # Rust Merkle tree implementation
-│   ├── mpi_lora_onnx_exporter.py  # ONNX export utilities
-│   └── zk_proof_generator.py   # Proof generation core
+│   ├── proof_contract.py       # Transcript and artifact contract
+│   └── zk_proof_generator.py   # Native proof generation core
+├── src/lib.rs                  # Halo2/PyO3 native prover
 ├── scripts/                    # Sample usage scripts
 ├── pyproject.toml             # Build configuration
 └── requirements.txt           # Dependencies
@@ -24,11 +25,11 @@ src/
 
 ### Zero-Knowledge Architecture
 
-The zero-knowledge proof system in ZKLoRA is built on polynomial commitments and succinct proofs. The `zk_proof_generator.py` module orchestrates the proof generation process by:
+The zero-knowledge proof system in ZKLoRA is built on transcript-bound LoRA delta statements and native Halo2 proofs. The `zk_proof_generator.py` module orchestrates the proof generation process by:
 
-1. Converting LoRA modules to ONNX format using `mpi_lora_onnx_exporter.py`
-2. Computing Merkle roots of model activations via `activations_commit.py`
-3. Generating zero-knowledge proofs that validate LoRA compatibility
+1. Capturing the base user's local transcript of activations and returned LoRA deltas
+2. Generating native `.zklora.*` proof artifacts for contributor-side LoRA invocations
+3. Verifying proof artifacts against the base user's transcript before accepting a module
 
 ### Multi-Party Inference Protocol
 
@@ -52,12 +53,7 @@ The Rust implementation is wrapped with Python bindings in the `libs/merkle` dir
 
 ### Performance Considerations
 
-ZKLoRA achieves its 1-2 second verification time through:
-
-- Parallel proof generation for multiple LoRA modules
-- Optimized ONNX conversions that minimize computational overhead
-- Efficient Merkle tree implementations in Rust
-- Careful memory management during large model operations
+Native Halo2 performance should be measured for the specific LoRA shapes being proven. The v1 implementation prioritizes proof-contract correctness and transcript binding before publishing benchmark claims.
 
 For detailed usage examples and high-level architecture, please refer to the [main README](../../README.md) in the project root.
 
@@ -73,7 +69,7 @@ For detailed usage examples and high-level architecture, please refer to the [ma
 
 ### Zero-Knowledge Components
 - `zk_proof_generator.py`: Core proof generation and verification
-- `mpi_lora_onnx_exporter.py`: ONNX export utilities for proof generation
+- `proof_contract.py`: Canonical transcript, statement, metadata, and artifact schemas
 - `activations_commit.py`: Merkle tree interface for model commitments
 
 ### Build & Distribution
@@ -110,7 +106,8 @@ server.list_lora_injection_points()
 from zklora import batch_verify_proofs
 
 verify_time, num_proofs = batch_verify_proofs(
-    proof_dir="proof_artifacts"
+    proof_dir="proof_artifacts",
+    transcript="b-transcript.json",
 )
 ```
 
