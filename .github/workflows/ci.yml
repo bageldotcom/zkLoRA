@@ -64,3 +64,39 @@ jobs:
         run: |
           pytest tests/ -v --tb=short --maxfail=1 \
             --cov=src/zklora/ --cov-branch --cov-fail-under=30
+
+  rust-native:
+    name: native Rust backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check Rust formatting
+        working-directory: src
+        run: cargo fmt --check
+
+      - name: Test Rust native backend
+        working-directory: src
+        run: cargo test --features python
+
+      - name: Check Python extension module feature
+        working-directory: src
+        run: cargo check --features extension-module
+
+      - name: Run release real-proof smoke test
+        working-directory: src
+        run: |
+          cargo test --release --features python \
+            real_proof_verifies_for_tiny_relation -- --ignored
