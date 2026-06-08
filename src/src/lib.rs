@@ -395,7 +395,7 @@ impl Circuit<Fp> for LoraCircuit {
                         &raw_a_bound,
                         offset,
                     )?;
-                    let q = div_round_away_from_zero(&raw_value, &scale)?;
+                    let q = div_round_to_canonical_interval(&raw_value, &scale)?;
                     let (intermediate_cell, next_offset) = assign_div_round(
                         &mut region,
                         &config,
@@ -469,7 +469,7 @@ impl Circuit<Fp> for LoraCircuit {
                         &raw_b_bound,
                         offset,
                     )?;
-                    let rescaled = div_round_away_from_zero(&raw_value, &scale)?;
+                    let rescaled = div_round_to_canonical_interval(&raw_value, &scale)?;
                     let (rescaled_cell, next_offset) = assign_div_round(
                         &mut region,
                         &config,
@@ -504,7 +504,8 @@ impl Circuit<Fp> for LoraCircuit {
                     )?;
 
                     let scaling_den_big = BigInt::from(self.scaling_den);
-                    let final_delta = div_round_away_from_zero(&scaled_raw, &scaling_den_big)?;
+                    let final_delta =
+                        div_round_to_canonical_interval(&scaled_raw, &scaling_den_big)?;
                     let (final_cell, next_offset) = assign_div_round(
                         &mut region,
                         &config,
@@ -789,7 +790,7 @@ fn assign_div_round(
         quotient_bound,
         offset,
     )?;
-    let (lower, upper) = deterministic_remainder_interval(raw_value, denominator);
+    let (lower, upper) = canonical_remainder_interval(denominator);
     offset = range_check_signed_interval(
         region,
         config,
@@ -975,31 +976,22 @@ fn validate_field_safety(circuit: &LoraCircuit) -> Result<(), NativeError> {
     Ok(())
 }
 
-fn deterministic_remainder_interval(raw: &BigInt, denominator: &BigInt) -> (BigInt, BigInt) {
+fn canonical_remainder_interval(denominator: &BigInt) -> (BigInt, BigInt) {
     let two = BigInt::from(2u8);
     let floor_half = denominator / &two;
-    if raw.is_negative() {
-        (-((denominator - BigInt::one()) / &two), floor_half)
-    } else {
-        (-&floor_half, (denominator - BigInt::one()) / &two)
-    }
+    (-&floor_half, (denominator - BigInt::one()) / &two)
 }
 
-fn div_round_away_from_zero(numerator: &BigInt, denominator: &BigInt) -> Result<BigInt, Error> {
+fn div_round_to_canonical_interval(
+    numerator: &BigInt,
+    denominator: &BigInt,
+) -> Result<BigInt, Error> {
     if denominator <= &BigInt::zero() {
         return Err(Error::Synthesis);
     }
-    let sign = if numerator.is_negative() { -1 } else { 1 };
-    let magnitude = numerator.abs();
-    let (mut quotient, remainder) = magnitude.div_rem(denominator);
-    if &remainder * 2 >= *denominator {
-        quotient += 1;
-    }
-    if sign < 0 {
-        Ok(-quotient)
-    } else {
-        Ok(quotient)
-    }
+    let two = BigInt::from(2u8);
+    let floor_half = denominator / &two;
+    Ok((numerator + &floor_half).div_floor(denominator))
 }
 
 fn fp_from_i64(value: i64) -> Fp {
@@ -1380,20 +1372,20 @@ mod tests {
             rank: 1,
             out_dim: 1,
             fixed_point: FixedPointConfig {
-                scale_bits: 0,
-                value_bits: 3,
-                intermediate_bits: 4,
+                scale_bits: 1,
+                value_bits: 8,
+                intermediate_bits: 16,
             },
             scaling_num: 1,
             scaling_den: 1,
             a: vec![vec![1]],
-            b: vec![vec![1]],
+            b: vec![vec![-2]],
         };
         LoraCircuit {
             a: input.a.clone(),
             b: input.b.clone(),
-            x: vec![1],
-            delta: vec![1],
+            x: vec![2],
+            delta: vec![-1],
             fixed_point: input.fixed_point.clone(),
             scaling_num: input.scaling_num,
             scaling_den: input.scaling_den,

@@ -18,6 +18,7 @@ from ..proof_contract import (
 
 
 _JSON_LENGTH_BYTES = 8
+_MAX_JSON_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
 def _json_ready(value: Any) -> Any:
@@ -41,6 +42,8 @@ def _send_json_message(sock: socket.socket, message: dict[str, Any]) -> None:
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    if len(payload) > _MAX_JSON_MESSAGE_BYTES:
+        raise RuntimeError("JSON message exceeds maximum frame size.")
     sock.sendall(len(payload).to_bytes(_JSON_LENGTH_BYTES, "big") + payload)
 
 
@@ -70,6 +73,8 @@ def _recv_json_message(sock: socket.socket) -> dict[str, Any] | None:
     size = int.from_bytes(header, "big")
     if size <= 0:
         raise RuntimeError("Received empty JSON message.")
+    if size > _MAX_JSON_MESSAGE_BYTES:
+        raise RuntimeError("Received JSON message exceeds maximum frame size.")
     payload = _recv_exact(sock, size)
     if payload is None:
         raise RuntimeError("Unexpected EOF while reading JSON payload.")
@@ -396,6 +401,7 @@ class BaseModelClient:
 
     def init_and_patch(self):
         """Query all contributors for injection points and patch the model."""
+        patched_modules: set[str] = set()
         for comm in self.comms:
             submods = comm.init_request()
             print("[B] injection points =>", submods)
@@ -403,6 +409,11 @@ class BaseModelClient:
                 if not full_name.strip():
                     print("[B] skipping empty submodule name.")
                     continue
+                if full_name in patched_modules:
+                    raise RuntimeError(
+                        "duplicate LoRA injection point from contributors is unsupported: "
+                        f"{full_name}"
+                    )
                 try:
                     path_parts = full_name.split(".")
                     *parents, child = path_parts
@@ -416,6 +427,7 @@ class BaseModelClient:
                         transcript_recorder=self.transcript,
                     )
                     setattr(m, child, wrapped)
+                    patched_modules.add(full_name)
                     print(
                         f"[B] Patched submodule '{full_name}' from {comm.host_a}:{comm.port_a}."
                     )

@@ -14,7 +14,7 @@ extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
 halo2_proofs = "0.3.2"
-halo2_gadgets = "0.4"
+halo2_gadgets = "0.5"
 ff = "0.13"
 num-bigint = "0.4"
 num-integer = "0.1"

@@ -33,7 +33,13 @@ def generate_proofs(
     proofs = 0
     total_params = 0
 
-    for record in records or []:
+    record_list = list(records or [])
+    if not record_list:
+        raise ProofContractError(
+            "native ZKLoRA proof generation requires captured invocation records"
+        )
+
+    for record in record_list:
         write_invocation_artifacts(output_dir, record)
         total_params += record.rank * record.in_dim + record.out_dim * record.rank
         proofs += 1

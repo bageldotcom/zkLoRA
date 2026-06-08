@@ -166,20 +166,15 @@ def _check_range(value: int, bound: int, label: str) -> None:
         raise ProofContractError(f"{label} {value} exceeds signed bound +/-{bound}")
 
 
-def _div_round_away_from_zero(numerator: int, denominator: int) -> int:
+def _div_round_to_canonical_interval(numerator: int, denominator: int) -> int:
     if denominator <= 0:
         raise ProofContractError("denominator must be positive")
-    sign = -1 if numerator < 0 else 1
-    magnitude = abs(numerator)
-    quotient, remainder = divmod(magnitude, denominator)
-    if remainder * 2 >= denominator:
-        quotient += 1
-    return sign * quotient
+    return (numerator + denominator // 2) // denominator
 
 
 def _rescale(value: int, config: FixedPointConfig) -> int:
     _check_range(value, config.intermediate_bound, "intermediate")
-    return _div_round_away_from_zero(value, config.scale)
+    return _div_round_to_canonical_interval(value, config.scale)
 
 
 def validate_matrix(matrix: list[list[int]], rows: int, cols: int, label: str) -> None:
@@ -223,7 +218,9 @@ def compute_delta_quantized(
     for row in b:
         raw = sum(int(weight) * int(value) for weight, value in zip(row, intermediate))
         scaled = _rescale(raw, config)
-        scaled = _div_round_away_from_zero(scaled * int(scaling_num), int(scaling_den))
+        scaled = _div_round_to_canonical_interval(
+            scaled * int(scaling_num), int(scaling_den)
+        )
         _check_range(scaled, config.value_bound, "delta")
         delta.append(scaled)
     return delta
@@ -399,9 +396,10 @@ def module_slug(module_name: str) -> str:
 def artifact_prefix(
     output_dir: str | os.PathLike[str], statement: dict[str, Any]
 ) -> Path:
-    return (
-        Path(output_dir)
-        / f"{module_slug(statement['module_name'])}.{int(statement['invocation_index']):04d}"
+    return Path(output_dir) / (
+        f"{module_slug(statement['session_id'])}."
+        f"{module_slug(statement['module_name'])}."
+        f"{int(statement['invocation_index']):04d}"
     )
 
 
