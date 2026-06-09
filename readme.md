@@ -3,8 +3,8 @@
 </p>
 
 <p align="center">
-  <a href="https://twitter.com/bagelopenAI">
-    <img src="https://img.shields.io/twitter/follow/bagelopenAI?style=flat-square" alt="Twitter Follow"/>
+  <a href="https://twitter.com/bageldotcom">
+    <img src="https://img.shields.io/twitter/follow/bageldotcom?style=flat-square" alt="Twitter Follow"/>
   </a>
   
   <a href="https://blog.bagel.net">
