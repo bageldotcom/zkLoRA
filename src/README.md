@@ -1,6 +1,6 @@
-# ZKLoRA Source Code Structure
+# zkLoRA Source Code Structure
 
-This directory contains the core implementation of ZKLoRA. Here's a detailed overview of the key components and their interactions.
+This directory contains the core implementation of zkLoRA. Here's a detailed overview of the key components and their interactions.
 
 ## Directory Structure
 
@@ -25,7 +25,7 @@ src/
 
 ### Zero-Knowledge Architecture
 
-The zero-knowledge proof system in ZKLoRA is built on transcript-bound LoRA delta statements and native Halo2 proofs. The `zk_proof_generator.py` module orchestrates the proof generation process by:
+The zero-knowledge proof system in zkLoRA is built on transcript-bound LoRA delta statements and native Halo2 proofs. The `zk_proof_generator.py` module orchestrates the proof generation process by:
 
 1. Capturing the base user's local transcript of activations and returned LoRA deltas
 2. Binding each proof to a verifier-pinned pre-inference adapter manifest with a Poseidon adapter commitment
