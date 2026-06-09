@@ -10,7 +10,7 @@ use halo2_proofs::{
     pasta::{vesta, EqAffine, Fp},
     plonk::{
         create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column,
-        ConstraintSystem, Error, Instance, Selector, SingleVerifier,
+        ConstraintSystem, Error, Instance, ProvingKey, Selector, SingleVerifier,
     },
     poly::commitment::Params,
     poly::Rotation,
@@ -22,7 +22,9 @@ use num_traits::{One, Signed, Zero};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::convert::TryInto;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const ADAPTER_COMMITMENT_DOMAIN: u64 = 0x5a4b4c4f5241; // "ZKLORA"
 const ADAPTER_COMMITMENT_VERSION: u64 = 1;
@@ -30,6 +32,11 @@ const ADAPTER_COMMITMENT_VERSION: u64 = 1;
 const ARTIFACT_SCHEMA_VERSION: u64 = 2;
 const FIELD_SAFE_BITS: usize = 250;
 const POSEIDON_PAIR_ROWS: usize = 96;
+// Caps for the legacy backend: artifacts beyond these shapes are rejected before
+// any keygen work so a hostile statement cannot stall the verifier.
+const MAX_LEGACY_K: u32 = 24;
+const MAX_LEGACY_DIM: usize = 16_384;
+const MAX_LEGACY_RANK: usize = 1_024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeError {
@@ -608,6 +615,21 @@ impl LoraCircuit {
             ));
         }
         let in_dim = self.in_dim();
+        if in_dim > MAX_LEGACY_DIM || self.out_dim() > MAX_LEGACY_DIM {
+            return Err(NativeError::InvalidDimensions(format!(
+                "legacy artifact exceeds verification caps: dims {}x{} beyond {}",
+                in_dim,
+                self.out_dim(),
+                MAX_LEGACY_DIM
+            )));
+        }
+        if self.rank() > MAX_LEGACY_RANK {
+            return Err(NativeError::InvalidDimensions(format!(
+                "legacy artifact exceeds verification caps: rank {} beyond {}",
+                self.rank(),
+                MAX_LEGACY_RANK
+            )));
+        }
         for row in &self.a {
             if row.len() != in_dim {
                 return Err(NativeError::InvalidDimensions(
@@ -1197,6 +1219,60 @@ fn k_for(circuit: &LoraCircuit) -> u32 {
     rows.trailing_zeros().max(8)
 }
 
+/// Cache key covering everything the circuit structure (and therefore the
+/// params/keys) depends on: the in-circuit constants are derived solely from
+/// dims, fixed-point widths, and scaling; witness values never enter keygen.
+type LegacyShapeKey = (u32, usize, usize, usize, u32, u32, u32, i64, i64);
+
+struct LegacyKeys {
+    params: Params<EqAffine>,
+    pk: ProvingKey<EqAffine>,
+}
+
+static LEGACY_KEY_CACHE: OnceLock<Mutex<HashMap<LegacyShapeKey, Arc<LegacyKeys>>>> =
+    OnceLock::new();
+
+fn legacy_cache() -> &'static Mutex<HashMap<LegacyShapeKey, Arc<LegacyKeys>>> {
+    LEGACY_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn legacy_shape_key(circuit: &LoraCircuit, k: u32) -> LegacyShapeKey {
+    (
+        k,
+        circuit.in_dim(),
+        circuit.rank(),
+        circuit.out_dim(),
+        circuit.fixed_point.scale_bits,
+        circuit.fixed_point.value_bits,
+        circuit.fixed_point.intermediate_bits,
+        circuit.scaling_num,
+        circuit.scaling_den,
+    )
+}
+
+fn legacy_keys_for(circuit: &LoraCircuit) -> Result<Arc<LegacyKeys>, NativeError> {
+    let k = k_for(circuit);
+    if k > MAX_LEGACY_K {
+        return Err(NativeError::InvalidDimensions(format!(
+            "legacy artifact exceeds verification caps: k {k} beyond {MAX_LEGACY_K}"
+        )));
+    }
+    let key = legacy_shape_key(circuit, k);
+    if let Some(found) = legacy_cache().lock().expect("legacy key cache").get(&key) {
+        return Ok(found.clone());
+    }
+    let params: Params<EqAffine> = Params::new(k);
+    let empty = circuit.without_witnesses();
+    let vk = keygen_vk(&params, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    let pk = keygen_pk(&params, vk, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    let entry = Arc::new(LegacyKeys { params, pk });
+    legacy_cache()
+        .lock()
+        .expect("legacy key cache")
+        .insert(key, entry.clone());
+    Ok(entry)
+}
+
 fn circuit_from_json(statement_json: &str, witness_json: &str) -> Result<LoraCircuit, NativeError> {
     let statement: NativeStatement =
         serde_json::from_str(statement_json).map_err(|e| NativeError::Json(e.to_string()))?;
@@ -1236,16 +1312,13 @@ fn default_scaling_den() -> i64 {
 
 pub fn prove_bytes(statement_json: &str, witness_json: &str) -> Result<Vec<u8>, NativeError> {
     let circuit = circuit_from_json(statement_json, witness_json)?;
-    let k = k_for(&circuit);
-    let params: Params<EqAffine> = Params::new(k);
-    let vk = keygen_vk(&params, &circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
-    let pk = keygen_pk(&params, vk, &circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    let keys = legacy_keys_for(&circuit)?;
     let instances = public_inputs(&circuit)?;
     let instance_refs: Vec<&[Fp]> = vec![instances.as_slice()];
     let mut transcript = Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
     create_proof(
-        &params,
-        &pk,
+        &keys.params,
+        &keys.pk,
         &[circuit],
         &[instance_refs.as_slice()],
         &mut OsRng,
@@ -1266,16 +1339,14 @@ pub fn verify_bytes(statement_json: &str, proof: &[u8]) -> Result<bool, NativeEr
         statement_json,
         &serde_json::to_string(&witness_shape).map_err(|e| NativeError::Json(e.to_string()))?,
     )?;
-    let k = k_for(&circuit);
-    let params: Params<EqAffine> = Params::new(k);
-    let vk = keygen_vk(&params, &circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    let keys = legacy_keys_for(&circuit)?;
     let instances = public_inputs(&circuit)?;
     let instance_refs: Vec<&[Fp]> = vec![instances.as_slice()];
     let mut transcript = Blake2bRead::<_, vesta::Affine, Challenge255<_>>::init(proof);
     let result = verify_proof(
-        &params,
-        &vk,
-        SingleVerifier::new(&params),
+        &keys.params,
+        keys.pk.get_vk(),
+        SingleVerifier::new(&keys.params),
         &[instance_refs.as_slice()],
         &mut transcript,
     );
@@ -1403,6 +1474,52 @@ mod tests {
         let mut changed = input;
         changed.b[0][0] += 1;
         assert_ne!(first, adapter_commitment_for_input(&changed).unwrap());
+    }
+
+    #[test]
+    fn legacy_key_cache_reuses_entries() {
+        let circuit = minimal_circuit();
+        let first = legacy_keys_for(&circuit).unwrap();
+        let second = legacy_keys_for(&circuit).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let key = legacy_shape_key(&circuit, k_for(&circuit));
+        assert!(legacy_cache().lock().unwrap().contains_key(&key));
+    }
+
+    #[test]
+    fn legacy_caps_reject_oversized_dimensions() {
+        let fixed_point = FixedPointConfig {
+            scale_bits: 1,
+            value_bits: 8,
+            intermediate_bits: 16,
+        };
+        let wide = LoraCircuit {
+            a: vec![vec![0; MAX_LEGACY_DIM + 1]],
+            b: vec![vec![0]],
+            x: vec![0; MAX_LEGACY_DIM + 1],
+            delta: vec![0],
+            fixed_point: fixed_point.clone(),
+            scaling_num: 1,
+            scaling_den: 1,
+            adapter_commitment: "0".to_string(),
+            statement_digest: "22".repeat(32),
+        };
+        let err = wide.validate().unwrap_err();
+        assert!(err.to_string().contains("exceeds verification caps"));
+
+        let deep = LoraCircuit {
+            a: vec![vec![0]; MAX_LEGACY_RANK + 1],
+            b: vec![vec![0; MAX_LEGACY_RANK + 1]],
+            x: vec![0],
+            delta: vec![0],
+            fixed_point,
+            scaling_num: 1,
+            scaling_den: 1,
+            adapter_commitment: "0".to_string(),
+            statement_digest: "22".repeat(32),
+        };
+        let err = deep.validate().unwrap_err();
+        assert!(err.to_string().contains("exceeds verification caps"));
     }
 
     #[test]
