@@ -67,7 +67,7 @@ def _native_v3():
     if native is None:
         raise ProofContractError(
             "native projection prover is unavailable; build/install zklora with "
-            "maturin, or set ZKLORA_PROVER_BACKEND=legacy-halo2 for the legacy "
+            "maturin, or unset ZKLORA_PROVER_BACKEND to use the default legacy "
             "backend"
         )
     missing = [
@@ -82,9 +82,10 @@ def _native_v3():
     ]
     if missing:
         raise ProofContractError(
-            "installed native module does not support the projection backend "
-            f"(missing {', '.join(missing)}); rebuild zklora with maturin or set "
-            "ZKLORA_PROVER_BACKEND=legacy-halo2"
+            "installed native module does not support the opt-in projection "
+            f"backend (missing {', '.join(missing)}); rebuild zklora with a "
+            "native module that ships v3 support, or unset "
+            "ZKLORA_PROVER_BACKEND to use the default legacy backend"
         )
     return native
 
@@ -140,17 +141,25 @@ def ensure_secret_outside_artifacts(
         )
 
 
+def _read_contributor_secret(path: Path) -> str:
+    data = load_json(path)
+    seed = str(data.get("seed", ""))
+    if len(seed) != 64 or any(c not in "0123456789abcdef" for c in seed.lower()):
+        raise ProofContractError(f"malformed contributor secret at {path}")
+    return seed
+
+
 def load_or_create_contributor_secret(path: Path) -> str:
     path = path.expanduser()
     if path.exists():
-        data = load_json(path)
-        seed = str(data.get("seed", ""))
-        if len(seed) != 64 or any(c not in "0123456789abcdef" for c in seed.lower()):
-            raise ProofContractError(f"malformed contributor secret at {path}")
-        return seed
+        return _read_contributor_secret(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     seed = secrets.token_hex(32)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        # Lost a concurrent-creation race; the winner's seed is authoritative.
+        return _read_contributor_secret(path)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(canonical_json({"seed": seed}) + "\n")
     return seed
@@ -467,6 +476,18 @@ def statement_from_batch(
     )
 
     for row in batch.rows:
+        # The statement pins input_shape/output_shape to the flat [in_dim] /
+        # [out_dim] form and verification requires every transcript row to
+        # match it exactly; reject other recorded shapes here so a drifting
+        # capture path fails at generation time with a clear error instead of
+        # producing artifacts that can never verify.
+        if list(row.input_shape) != [in_dim] or list(row.output_shape) != [out_dim]:
+            raise ProofContractError(
+                "schema-3 statements require per-row shapes "
+                f"[{in_dim}]/[{out_dim}]; {batch.module_name}"
+                f"#{row.invocation_index} recorded input_shape="
+                f"{row.input_shape} output_shape={row.output_shape}"
+            )
         expected = compute_delta_quantized(
             first.a,
             first.b,
@@ -664,6 +685,44 @@ def manifest_commitment_of(payload: dict[str, Any]) -> str:
 _MANIFEST_META_KEY = "__zklora_manifest__"
 
 
+def _index_expected_adapter(index: dict[str, Any], entry: dict[str, Any]) -> None:
+    module_name = entry["module_name"]
+    if module_name in index:
+        raise ProofContractError(f"duplicate expected adapter for {module_name}")
+    if "a_commitment" in entry:
+        scheme = entry.get("adapter_commitment", {}).get("scheme")
+        if scheme != COMMITMENT_SCHEME_V3:
+            raise ProofContractError(
+                f"unsupported v3 adapter commitment scheme for {module_name}"
+            )
+        expected_value = digest_hex(
+            {
+                "module_name": entry["module_name"],
+                "rank": int(entry["rank"]),
+                "in_dim": int(entry["in_dim"]),
+                "out_dim": int(entry["out_dim"]),
+                "fixed_point": entry["fixed_point"],
+                "scaling": entry["scaling"],
+                "a_commitment": list(entry["a_commitment"]),
+                "b_commitment": list(entry["b_commitment"]),
+                "commitment_nonce": str(entry["commitment_nonce"]),
+            }
+        )
+        if entry["adapter_commitment"].get("value") != expected_value:
+            raise ProofContractError(
+                f"manifest adapter commitment mismatch for {module_name}"
+            )
+        _check_v3_dims(
+            int(entry["in_dim"]), int(entry["rank"]), int(entry["out_dim"]), 1
+        )
+        native = _native_v3()
+        if not native.verify_adapter_manifest_v3(canonical_json(entry)):
+            raise ProofContractError(
+                f"manifest adapter range proof failed for {module_name}"
+            )
+    index[module_name] = entry
+
+
 def load_expected_adapters_any(
     expected_adapters: str
     | os.PathLike[str]
@@ -692,43 +751,18 @@ def load_expected_adapters_any(
 
     index: dict[str, Any] = {}
     has_v3 = False
-    for entry in adapters:
-        module_name = entry["module_name"]
-        if module_name in index:
-            raise ProofContractError(f"duplicate expected adapter for {module_name}")
+    for position, entry in enumerate(adapters):
+        try:
+            _index_expected_adapter(index, entry)
+        except ProofContractError:
+            raise
+        except (KeyError, TypeError, IndexError, ValueError, AttributeError) as exc:
+            raise ProofContractError(
+                f"malformed expected adapter entry at position {position}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         if "a_commitment" in entry:
             has_v3 = True
-            scheme = entry.get("adapter_commitment", {}).get("scheme")
-            if scheme != COMMITMENT_SCHEME_V3:
-                raise ProofContractError(
-                    f"unsupported v3 adapter commitment scheme for {module_name}"
-                )
-            expected_value = digest_hex(
-                {
-                    "module_name": entry["module_name"],
-                    "rank": int(entry["rank"]),
-                    "in_dim": int(entry["in_dim"]),
-                    "out_dim": int(entry["out_dim"]),
-                    "fixed_point": entry["fixed_point"],
-                    "scaling": entry["scaling"],
-                    "a_commitment": list(entry["a_commitment"]),
-                    "b_commitment": list(entry["b_commitment"]),
-                    "commitment_nonce": str(entry["commitment_nonce"]),
-                }
-            )
-            if entry["adapter_commitment"].get("value") != expected_value:
-                raise ProofContractError(
-                    f"manifest adapter commitment mismatch for {module_name}"
-                )
-            _check_v3_dims(
-                int(entry["in_dim"]), int(entry["rank"]), int(entry["out_dim"]), 1
-            )
-            native = _native_v3()
-            if not native.verify_adapter_manifest_v3(canonical_json(entry)):
-                raise ProofContractError(
-                    f"manifest adapter range proof failed for {module_name}"
-                )
-        index[module_name] = entry
 
     manifest_commitment = None
     if has_v3:
@@ -953,6 +987,28 @@ def verify_v3_artifact_set(
     transcript_index: dict[tuple[str, str, int], TranscriptEntry],
     adapters_index: dict[str, Any],
 ) -> None:
+    # Artifacts are hostile input: structural surprises (missing keys, wrong
+    # JSON types, non-numeric strings) must surface as contract errors, not
+    # raw KeyError/TypeError crashes. ProofContractError subclasses ValueError
+    # and must pass through unwrapped.
+    try:
+        _verify_v3_artifact_set_checked(
+            statement_path, transcript_index, adapters_index
+        )
+    except ProofContractError:
+        raise
+    except (KeyError, TypeError, IndexError, ValueError, AttributeError) as exc:
+        raise ProofContractError(
+            f"malformed schema-3 proof artifact {Path(statement_path).name}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _verify_v3_artifact_set_checked(
+    statement_path: str | os.PathLike[str],
+    transcript_index: dict[tuple[str, str, int], TranscriptEntry],
+    adapters_index: dict[str, Any],
+) -> None:
     statement = load_json(statement_path)
     if (
         statement.get("schema_version") != SCHEMA_VERSION_V3
@@ -1172,7 +1228,8 @@ def check_coverage(
             overlap = covered.intersection(claim.indices)
             if overlap:
                 raise ProofContractError(
-                    f"duplicate proof coverage for {key} rows {sorted(overlap)}"
+                    f"duplicate proof coverage for {key} rows {sorted(overlap)} "
+                    f"(claimed again by {claim.source})"
                 )
             covered.update(claim.indices)
         if covered != expected:

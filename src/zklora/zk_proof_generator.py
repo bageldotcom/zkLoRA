@@ -14,10 +14,17 @@ from .proof_contract import (
 _BACKEND_ENV = "ZKLORA_PROVER_BACKEND"
 _BACKEND_PROJECTION = "projection-v1"
 _BACKEND_LEGACY = "legacy-halo2"
+# The legacy backend stays the default until the native projection prover
+# (prove_v3/verify_v3) ships; flipping earlier would break proof generation on
+# every real install. The default flips to projection-v1 in the milestone that
+# delivers the native backend (M2).
+_BACKEND_DEFAULT = _BACKEND_LEGACY
 
 
-def _prover_backend() -> str:
-    backend = os.environ.get(_BACKEND_ENV, _BACKEND_PROJECTION)
+def prover_backend() -> str:
+    """Resolve the active prover backend from ``ZKLORA_PROVER_BACKEND``."""
+
+    backend = os.environ.get(_BACKEND_ENV, _BACKEND_DEFAULT)
     if backend not in (_BACKEND_PROJECTION, _BACKEND_LEGACY):
         raise ProofContractError(
             f"unknown {_BACKEND_ENV} value {backend!r}; expected "
@@ -54,14 +61,16 @@ def generate_proofs(
 ) -> tuple[float, float, float, int, int]:
     """Generate native zkLoRA proof artifacts for captured LoRA invocations.
 
-    The default ``projection-v1`` backend writes one artifact set per
-    contiguous batch of invocations (``proofs`` in the returned tuple counts
+    The default ``legacy-halo2`` backend writes one schema-2 artifact set per
+    invocation row. Setting ``ZKLORA_PROVER_BACKEND=projection-v1`` opts into
+    the schema-3 batch backend, which writes one artifact set per contiguous
+    batch of invocations (``proofs`` in the returned tuple then counts
     artifact sets, not rows) and requires the pinned schema-3 adapter manifest
-    plus the contributor secret used to commit it. Setting
-    ``ZKLORA_PROVER_BACKEND=legacy-halo2`` selects the unsupported legacy
-    rollback hatch, which writes one schema-2 artifact set per invocation row.
-    Legacy keyword arguments are accepted so old callers fail with a clear
-    no-records result instead of importing removed proof backends.
+    plus the contributor secret used to commit it. The projection backend
+    additionally requires a native module built with v3 support; until that
+    ships, opting in fails with a clear error. Legacy keyword arguments are
+    accepted so old callers fail with a clear no-records result instead of
+    importing removed proof backends.
     """
 
     import time
@@ -75,7 +84,7 @@ def generate_proofs(
             "native zkLoRA proof generation requires captured invocation records"
         )
 
-    backend = _prover_backend()
+    backend = prover_backend()
     if backend == _BACKEND_LEGACY:
         proofs, total_params = _generate_proofs_legacy(record_list, output_dir, verbose)
     else:

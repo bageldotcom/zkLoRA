@@ -130,7 +130,7 @@ a^i c^j` of degree ≤ (rows−1, rank−1); the check passes only if
 ≤ (rows + rank − 2)/p. Identities 2 and 3 are bounded analogously by
 (rows + out_dim − 2)/p and the id-2 consistency checks by (R−1)/p each. Union
 bound over the three identities, the consistency checks, the Schnorr, and the
-LFO/IPA knowledge errors stays below 2^−240 at `MAX_V3_ROWS`/`MAX_V3_DIM`;
+LFO/IPA knowledge errors stays below 2^−240 at `MAX_BATCH_ROWS`/`MAX_V3_DIM`;
 Fiat–Shamir grinding over `< 2^100` transcripts leaves > 128 bits. **One
 projection; no repetition** — repetition is a small-field Freivalds artifact.
 

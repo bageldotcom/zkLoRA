@@ -10,7 +10,7 @@ use halo2_proofs::{
     pasta::{vesta, EqAffine, Fp},
     plonk::{
         create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column,
-        ConstraintSystem, Error, Instance, ProvingKey, Selector, SingleVerifier,
+        ConstraintSystem, Error, Instance, ProvingKey, Selector, SingleVerifier, VerifyingKey,
     },
     poly::commitment::Params,
     poly::Rotation,
@@ -1224,16 +1224,128 @@ fn k_for(circuit: &LoraCircuit) -> u32 {
 /// dims, fixed-point widths, and scaling; witness values never enter keygen.
 type LegacyShapeKey = (u32, usize, usize, usize, u32, u32, u32, i64, i64);
 
-struct LegacyKeys {
-    params: Params<EqAffine>,
-    pk: ProvingKey<EqAffine>,
+/// Both caches are bounded: the cache keys span every attacker-influenceable
+/// statement field, so an unbounded map fed varying shapes is a slow memory
+/// DoS. Entries near k = MAX_LEGACY_K are GB-scale, hence the small caps.
+const MAX_LEGACY_KEY_CACHE_ENTRIES: usize = 4;
+const MAX_LEGACY_PARAMS_CACHE_ENTRIES: usize = 4;
+
+/// Minimal LRU map: a HashMap with a monotonically increasing use stamp per
+/// entry; inserting beyond capacity evicts the least recently used entry.
+struct BoundedLru<K, V> {
+    map: HashMap<K, (u64, V)>,
+    counter: u64,
+    capacity: usize,
 }
 
-static LEGACY_KEY_CACHE: OnceLock<Mutex<HashMap<LegacyShapeKey, Arc<LegacyKeys>>>> =
+impl<K: std::hash::Hash + Eq + Clone, V: Clone> BoundedLru<K, V> {
+    fn new(capacity: usize) -> Self {
+        BoundedLru {
+            map: HashMap::new(),
+            counter: 0,
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<V> {
+        self.counter += 1;
+        let stamp = self.counter;
+        self.map.get_mut(key).map(|slot| {
+            slot.0 = stamp;
+            slot.1.clone()
+        })
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        self.counter += 1;
+        if !self.map.contains_key(&key) && self.map.len() >= self.capacity {
+            if let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (stamp, _))| *stamp)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(key, (self.counter, value));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &K) -> bool {
+        self.map.contains_key(key)
+    }
+}
+
+/// Verification only ever needs the verifying key; the proving key is built
+/// (and cached) lazily the first time a shape is actually proven, so a
+/// verifier never pays keygen_pk for hostile or one-off shapes.
+enum LegacyKeys {
+    VerifyOnly {
+        params: Arc<Params<EqAffine>>,
+        vk: VerifyingKey<EqAffine>,
+    },
+    Prover {
+        params: Arc<Params<EqAffine>>,
+        pk: ProvingKey<EqAffine>,
+    },
+}
+
+impl LegacyKeys {
+    fn params(&self) -> &Params<EqAffine> {
+        match self {
+            LegacyKeys::VerifyOnly { params, .. } => params,
+            LegacyKeys::Prover { params, .. } => params,
+        }
+    }
+
+    fn vk(&self) -> &VerifyingKey<EqAffine> {
+        match self {
+            LegacyKeys::VerifyOnly { vk, .. } => vk,
+            LegacyKeys::Prover { pk, .. } => pk.get_vk(),
+        }
+    }
+
+    fn pk(&self) -> Option<&ProvingKey<EqAffine>> {
+        match self {
+            LegacyKeys::VerifyOnly { .. } => None,
+            LegacyKeys::Prover { pk, .. } => Some(pk),
+        }
+    }
+}
+
+static LEGACY_KEY_CACHE: OnceLock<Mutex<BoundedLru<LegacyShapeKey, Arc<LegacyKeys>>>> =
+    OnceLock::new();
+static LEGACY_PARAMS_CACHE: OnceLock<Mutex<BoundedLru<u32, Arc<Params<EqAffine>>>>> =
     OnceLock::new();
 
-fn legacy_cache() -> &'static Mutex<HashMap<LegacyShapeKey, Arc<LegacyKeys>>> {
-    LEGACY_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Cached values are immutable once inserted (Arc'd keys/params plus LRU
+/// bookkeeping), so a panic in another thread cannot leave them torn;
+/// recover from poisoning instead of propagating panics through PyO3.
+fn lock_recovering<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn legacy_cache() -> &'static Mutex<BoundedLru<LegacyShapeKey, Arc<LegacyKeys>>> {
+    LEGACY_KEY_CACHE.get_or_init(|| Mutex::new(BoundedLru::new(MAX_LEGACY_KEY_CACHE_ENTRIES)))
+}
+
+fn legacy_params_for(k: u32) -> Arc<Params<EqAffine>> {
+    let cache =
+        LEGACY_PARAMS_CACHE.get_or_init(|| Mutex::new(BoundedLru::new(MAX_LEGACY_PARAMS_CACHE_ENTRIES)));
+    if let Some(found) = lock_recovering(cache).get(&k) {
+        return found;
+    }
+    // Built outside the lock: Params::new at large k takes seconds and two
+    // racing builders are deterministic, so last-write-wins is harmless.
+    let params = Arc::new(Params::<EqAffine>::new(k));
+    lock_recovering(cache).insert(k, params.clone());
+    params
 }
 
 fn legacy_shape_key(circuit: &LoraCircuit, k: u32) -> LegacyShapeKey {
@@ -1250,7 +1362,7 @@ fn legacy_shape_key(circuit: &LoraCircuit, k: u32) -> LegacyShapeKey {
     )
 }
 
-fn legacy_keys_for(circuit: &LoraCircuit) -> Result<Arc<LegacyKeys>, NativeError> {
+fn legacy_keys_for(circuit: &LoraCircuit, need_pk: bool) -> Result<Arc<LegacyKeys>, NativeError> {
     let k = k_for(circuit);
     if k > MAX_LEGACY_K {
         return Err(NativeError::InvalidDimensions(format!(
@@ -1258,18 +1370,25 @@ fn legacy_keys_for(circuit: &LoraCircuit) -> Result<Arc<LegacyKeys>, NativeError
         )));
     }
     let key = legacy_shape_key(circuit, k);
-    if let Some(found) = legacy_cache().lock().expect("legacy key cache").get(&key) {
-        return Ok(found.clone());
+    if let Some(found) = lock_recovering(legacy_cache()).get(&key) {
+        if !need_pk || found.pk().is_some() {
+            return Ok(found);
+        }
     }
-    let params: Params<EqAffine> = Params::new(k);
+    // Keygen runs outside the lock so concurrent callers on other shapes are
+    // not serialized behind it; duplicated keygen on the same shape is
+    // deterministic and last-write-wins.
+    let params = legacy_params_for(k);
     let empty = circuit.without_witnesses();
     let vk = keygen_vk(&params, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
-    let pk = keygen_pk(&params, vk, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
-    let entry = Arc::new(LegacyKeys { params, pk });
-    legacy_cache()
-        .lock()
-        .expect("legacy key cache")
-        .insert(key, entry.clone());
+    let entry = if need_pk {
+        let pk =
+            keygen_pk(&params, vk, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
+        Arc::new(LegacyKeys::Prover { params, pk })
+    } else {
+        Arc::new(LegacyKeys::VerifyOnly { params, vk })
+    };
+    lock_recovering(legacy_cache()).insert(key, entry.clone());
     Ok(entry)
 }
 
@@ -1312,13 +1431,14 @@ fn default_scaling_den() -> i64 {
 
 pub fn prove_bytes(statement_json: &str, witness_json: &str) -> Result<Vec<u8>, NativeError> {
     let circuit = circuit_from_json(statement_json, witness_json)?;
-    let keys = legacy_keys_for(&circuit)?;
+    let keys = legacy_keys_for(&circuit, true)?;
+    let pk = keys.pk().expect("prover cache entry carries a proving key");
     let instances = public_inputs(&circuit)?;
     let instance_refs: Vec<&[Fp]> = vec![instances.as_slice()];
     let mut transcript = Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
     create_proof(
-        &keys.params,
-        &keys.pk,
+        keys.params(),
+        pk,
         &[circuit],
         &[instance_refs.as_slice()],
         &mut OsRng,
@@ -1339,14 +1459,14 @@ pub fn verify_bytes(statement_json: &str, proof: &[u8]) -> Result<bool, NativeEr
         statement_json,
         &serde_json::to_string(&witness_shape).map_err(|e| NativeError::Json(e.to_string()))?,
     )?;
-    let keys = legacy_keys_for(&circuit)?;
+    let keys = legacy_keys_for(&circuit, false)?;
     let instances = public_inputs(&circuit)?;
     let instance_refs: Vec<&[Fp]> = vec![instances.as_slice()];
     let mut transcript = Blake2bRead::<_, vesta::Affine, Challenge255<_>>::init(proof);
     let result = verify_proof(
-        &keys.params,
-        keys.pk.get_vk(),
-        SingleVerifier::new(&keys.params),
+        keys.params(),
+        keys.vk(),
+        SingleVerifier::new(keys.params()),
         &[instance_refs.as_slice()],
         &mut transcript,
     );
@@ -1477,13 +1597,43 @@ mod tests {
     }
 
     #[test]
-    fn legacy_key_cache_reuses_entries() {
+    fn legacy_key_cache_reuses_and_upgrades_entries() {
         let circuit = minimal_circuit();
-        let first = legacy_keys_for(&circuit).unwrap();
-        let second = legacy_keys_for(&circuit).unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
+        let verify_only = legacy_keys_for(&circuit, false).unwrap();
+        assert!(verify_only.pk().is_none());
+        let cached = legacy_keys_for(&circuit, false).unwrap();
+        assert!(Arc::ptr_eq(&verify_only, &cached));
+
+        // A prover call on the same shape upgrades the entry in place...
+        let prover = legacy_keys_for(&circuit, true).unwrap();
+        assert!(prover.pk().is_some());
+        // ...and both later verifiers and provers share the upgraded entry.
+        let reused_verify = legacy_keys_for(&circuit, false).unwrap();
+        assert!(Arc::ptr_eq(&prover, &reused_verify));
+        let reused_prover = legacy_keys_for(&circuit, true).unwrap();
+        assert!(Arc::ptr_eq(&prover, &reused_prover));
+
         let key = legacy_shape_key(&circuit, k_for(&circuit));
-        assert!(legacy_cache().lock().unwrap().contains_key(&key));
+        assert!(lock_recovering(legacy_cache()).contains_key(&key));
+    }
+
+    #[test]
+    fn bounded_lru_evicts_least_recently_used() {
+        let mut lru: BoundedLru<u32, u32> = BoundedLru::new(2);
+        lru.insert(1, 10);
+        lru.insert(2, 20);
+        assert_eq!(lru.get(&1), Some(10)); // touch 1 so 2 becomes the oldest
+        lru.insert(3, 30);
+        assert_eq!(lru.len(), 2);
+        assert!(lru.contains_key(&1));
+        assert!(!lru.contains_key(&2));
+        assert!(lru.contains_key(&3));
+
+        // Re-inserting an existing key must not evict anything.
+        lru.insert(1, 11);
+        assert_eq!(lru.len(), 2);
+        assert_eq!(lru.get(&1), Some(11));
+        assert!(lru.contains_key(&3));
     }
 
     #[test]

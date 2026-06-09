@@ -8,7 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM
 from peft import PeftModel
 
-from ..zk_proof_generator import _prover_backend, generate_proofs
+from ..zk_proof_generator import generate_proofs, prover_backend
 from ..base_model_user_mpi import _recv_json_message, _send_json_message
 from ..proof_contract import (
     FixedPointConfig,
@@ -99,7 +99,7 @@ class LoRAServer:
         return list(self.submodules.keys())
 
     def adapter_manifest_entries(self):
-        legacy = _prover_backend() == "legacy-halo2"
+        legacy = prover_backend() == "legacy-halo2"
         if not legacy and self._manifest_entries is not None:
             # Schema-3 entries carry a fresh commitment nonce; the same entries
             # must back both the pinned manifest and every later proof, so they
@@ -148,7 +148,7 @@ class LoRAServer:
 
     def write_adapter_manifest(self, path: str):
         entries = self.adapter_manifest_entries()
-        if _prover_backend() == "legacy-halo2":
+        if prover_backend() == "legacy-halo2":
             write_adapter_manifest(path, entries)
             self._manifest_payload = None
         else:
@@ -236,7 +236,7 @@ class LoRAServer:
         else:
             records = self.session_data.pop(session_id, [])
 
-        if _prover_backend() == "legacy-halo2":
+        if prover_backend() == "legacy-halo2":
             proof_res = generate_proofs(
                 records=records,
                 output_dir=self.out_dir,

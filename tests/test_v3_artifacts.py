@@ -86,7 +86,10 @@ class FakeNativeBoth:
 @pytest.fixture(autouse=True)
 def fake_native(monkeypatch):
     monkeypatch.setattr(proof_contract, "_native_module", lambda: FakeNativeBoth())
-    monkeypatch.delenv("ZKLORA_PROVER_BACKEND", raising=False)
+    # These tests exercise the opt-in projection backend; the shipped default
+    # stays legacy-halo2 until the native v3 prover lands (see
+    # test_default_backend_is_legacy_until_native_v3_ships).
+    monkeypatch.setenv("ZKLORA_PROVER_BACKEND", "projection-v1")
     monkeypatch.delenv("ZKLORA_CHUNK_ROWS", raising=False)
     monkeypatch.delenv("ZKLORA_CONTRIBUTOR_SECRET", raising=False)
 
@@ -354,7 +357,7 @@ def test_expand_statement_rows_v2_and_v3(tmp_path, monkeypatch):
     assert v2_rows[0].x == records[0].x
 
 
-def test_legacy_hatch_generates_v2_artifacts(tmp_path, monkeypatch):
+def test_legacy_backend_generates_v2_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("ZKLORA_PROVER_BACKEND", "legacy-halo2")
     records = _records(3)
     a, b = _adapter()
@@ -372,6 +375,20 @@ def test_legacy_hatch_generates_v2_artifacts(tmp_path, monkeypatch):
         expected_adapters=[adapter_manifest_entry(MODULE, a, b, 1, 2, FP)],
     )
     assert count == 3
+
+
+def test_default_backend_is_legacy_until_native_v3_ships(tmp_path, monkeypatch):
+    # With ZKLORA_PROVER_BACKEND unset, proof generation must keep working on
+    # installs whose native module predates the projection backend, so the
+    # default stays legacy-halo2 until prove_v3/verify_v3 ship.
+    monkeypatch.delenv("ZKLORA_PROVER_BACKEND", raising=False)
+    records = _records(2)
+    out_dir = tmp_path / "artifacts"
+    generate_proofs(records, output_dir=str(out_dir))
+
+    statements = sorted(out_dir.glob("*.zklora.statement.json"))
+    assert len(statements) == 2
+    assert all(load_json(p)["schema_version"] == 2 for p in statements)
 
 
 def test_unknown_backend_rejected(tmp_path, monkeypatch):
@@ -393,7 +410,10 @@ def test_statement_and_proof_tamper_rejected(tmp_path, monkeypatch):
         json.dumps(statement, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ProofContractError, match="statement digest mismatch"):
+    # Anchored: a failed digest check is a genuine contract error and must not
+    # be re-wrapped by the malformed-artifact guard (ProofContractError is a
+    # ValueError subclass).
+    with pytest.raises(ProofContractError, match="^statement digest mismatch"):
         batch_verify_proofs(
             proof_dir=str(out_dir),
             transcript=_transcript(records),
@@ -452,6 +472,75 @@ def test_batch_grouping_contract():
     ]
     with pytest.raises(ProofContractError, match="inconsistent adapter weights"):
         build_batches(mixed, target_rows=4)
+
+
+def test_shape_drift_rejected_at_generation(tmp_path, monkeypatch):
+    records = _records(2)
+    records[1] = replace(records[1], input_shape=[1, 2])
+    payload = _v3_manifest()
+    with pytest.raises(ProofContractError, match="require per-row shapes"):
+        _generate(tmp_path, records, payload, chunk=2, monkeypatch=monkeypatch)
+
+
+def test_malformed_statement_rejected_cleanly(tmp_path, monkeypatch):
+    from zklora.proof_contract import digest_hex
+
+    records = _records(2)
+    payload = _v3_manifest()
+    out_dir = _generate(tmp_path, records, payload, chunk=2, monkeypatch=monkeypatch)
+    statement_path = out_dir / f"s1.{MODULE}.0000.zklora.statement.json"
+
+    # A hostile statement with a self-consistent digest but the wrong JSON
+    # type must fail as a contract error, not a raw TypeError/KeyError.
+    statement = load_json(statement_path)
+    statement["fixed_point"] = "not-a-mapping"
+    statement["statement_digest"] = digest_hex(
+        {k: v for k, v in statement.items() if k != "statement_digest"}
+    )
+    statement_path.write_text(
+        json.dumps(statement, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ProofContractError, match="malformed schema-3 proof artifact"):
+        batch_verify_proofs(
+            proof_dir=str(out_dir),
+            transcript=_transcript(records),
+            expected_adapters=payload,
+        )
+
+
+def test_malformed_manifest_entry_rejected_cleanly(tmp_path, monkeypatch):
+    records = _records(2)
+    payload = _v3_manifest()
+    out_dir = _generate(tmp_path, records, payload, chunk=2, monkeypatch=monkeypatch)
+
+    broken = json.loads(json.dumps(payload))
+    del broken["adapters"][0]["rank"]
+    with pytest.raises(ProofContractError, match="malformed expected adapter entry"):
+        batch_verify_proofs(
+            proof_dir=str(out_dir),
+            transcript=_transcript(records),
+            expected_adapters=broken,
+        )
+
+
+def test_secret_creation_race_returns_winner_seed(tmp_path, monkeypatch):
+    from zklora import proof_v3
+
+    path = tmp_path / "secrets" / "contributor.secret.json"
+    path.parent.mkdir(parents=True)
+    winner_seed = "cd" * 32
+    path.write_text(canonical_json({"seed": winner_seed}) + "\n", encoding="utf-8")
+
+    # Simulate losing the O_EXCL creation race: the existence pre-check says
+    # the file is absent, but creation finds it already present.
+    real_exists = Path.exists
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda self: False if self == path else real_exists(self),
+    )
+    assert proof_v3.load_or_create_contributor_secret(path) == winner_seed
 
 
 def test_bounds_composition_guards():
