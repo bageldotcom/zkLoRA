@@ -179,7 +179,7 @@ class LoRAServer:
 
     def finalize_proofs_and_collect(self, session_id: str | None = None):
         """
-        Generates native ZKLoRA proof artifacts for captured LoRA invocations.
+        Generates native zkLoRA proof artifacts for captured LoRA invocations.
         """
         print(f"[A] finalize_proofs_and_collect => native artifacts => {self.out_dir}")
         if session_id is None:
@@ -272,7 +272,7 @@ class LoRAServerSocket(threading.Thread):
                 )
                 resp = {
                     "response_type": "end_inference_ack",
-                    "message": "A finished native ZKLoRA proof generation locally.",
+                    "message": "A finished native zkLoRA proof generation locally.",
                 }
 
             else:

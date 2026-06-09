@@ -18,7 +18,7 @@ def generate_proofs(
     verbose: bool = False,
     **_legacy_kwargs,
 ) -> tuple[float, float, float, int, int]:
-    """Generate native ZKLoRA proof artifacts for captured LoRA invocations.
+    """Generate native zkLoRA proof artifacts for captured LoRA invocations.
 
     The old external-backend implementation scanned model-export directories. The native backend is
     transcript-first: callers pass invocation witnesses captured during multi-party
@@ -36,7 +36,7 @@ def generate_proofs(
     record_list = list(records or [])
     if not record_list:
         raise ProofContractError(
-            "native ZKLoRA proof generation requires captured invocation records"
+            "native zkLoRA proof generation requires captured invocation records"
         )
 
     for record in record_list:
@@ -45,7 +45,7 @@ def generate_proofs(
         proofs += 1
         if verbose:
             print(
-                f"Generated native ZKLoRA proof artifact for "
+                f"Generated native zkLoRA proof artifact for "
                 f"{record.module_name}#{record.invocation_index}"
             )
 
@@ -59,17 +59,17 @@ def batch_verify_proofs(
     expected_adapters=None,
     verbose: bool = False,
 ) -> tuple[float, int]:
-    """Verify native ZKLoRA proof artifacts against the base user's transcript."""
+    """Verify native zkLoRA proof artifacts against the base user's transcript."""
 
     if transcript is None:
         raise ProofContractError(
-            "native ZKLoRA verification requires the base user's transcript"
+            "native zkLoRA verification requires the base user's transcript"
         )
     if expected_adapters is None:
         raise ProofContractError(
-            "native ZKLoRA verification requires a pre-inference adapter manifest"
+            "native zkLoRA verification requires a pre-inference adapter manifest"
         )
     total_time, count = verify_artifacts(proof_dir, transcript, expected_adapters)
     if verbose:
-        print(f"Verified {count} native ZKLoRA proof artifacts in {total_time:.2f}s")
+        print(f"Verified {count} native zkLoRA proof artifacts in {total_time:.2f}s")
     return total_time, count
