@@ -11,7 +11,19 @@ def main():
         "--proof_dir",
         type=str,
         default="proof_artifacts",
-        help="Directory containing proof files (.pf), plus settings, vk, srs.",
+        help="Directory containing native .zklora proof artifacts.",
+    )
+    parser.add_argument(
+        "--transcript",
+        type=str,
+        required=True,
+        help="Base user transcript JSON captured during inference.",
+    )
+    parser.add_argument(
+        "--expected_adapters",
+        type=str,
+        required=True,
+        help="Pre-inference adapter manifest JSON agreed by the verifier.",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Print more details during verification."
@@ -19,7 +31,10 @@ def main():
     args = parser.parse_args()
 
     total_verify_time, num_proofs = batch_verify_proofs(
-        proof_dir=args.proof_dir, verbose=args.verbose
+        proof_dir=args.proof_dir,
+        transcript=args.transcript,
+        expected_adapters=args.expected_adapters,
+        verbose=args.verbose,
     )
     print(f"Done verifying {num_proofs} proofs. Total time: {total_verify_time:.2f}s")
 

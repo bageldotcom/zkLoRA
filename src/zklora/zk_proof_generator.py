@@ -1,245 +1,75 @@
-import os
-import glob
-import json
-import time
-import asyncio
-from typing import NamedTuple, Optional
+from __future__ import annotations
 
-import numpy as np
-import onnx
-import onnxruntime
-import ezkl
+from pathlib import Path
+from typing import Iterable
 
-
-class ProofPaths(NamedTuple):
-    circuit: str
-    settings: str
-    srs: str
-    verification_key: str
-    proving_key: str
-    witness: str
-    proof: str
+from .proof_contract import (
+    InvocationWitness,
+    ProofContractError,
+    TranscriptEntry,
+    verify_artifacts,
+    write_invocation_artifacts,
+)
 
 
-def resolve_proof_paths(proof_dir: str, base_name: str) -> Optional[ProofPaths]:
-    """Retrieves paths for all required proof-related files given a directory and base name."""
-    return ProofPaths(
-        circuit=os.path.join(proof_dir, f"{base_name}.ezkl"),
-        settings=os.path.join(proof_dir, f"{base_name}_settings.json"),
-        srs=os.path.join(proof_dir, "kzg.srs"),
-        verification_key=os.path.join(proof_dir, f"{base_name}.vk"),
-        proving_key=os.path.join(proof_dir, f"{base_name}.pk"),
-        witness=os.path.join(proof_dir, f"{base_name}_witness.json"),
-        proof=os.path.join(proof_dir, f"{base_name}.pf"),
-    )
+def generate_proofs(
+    records: Iterable[InvocationWitness] | None = None,
+    output_dir: str = "proof_artifacts",
+    verbose: bool = False,
+    **_legacy_kwargs,
+) -> tuple[float, float, float, int, int]:
+    """Generate native ZKLoRA proof artifacts for captured LoRA invocations.
+
+    The old external-backend implementation scanned model-export directories. The native backend is
+    transcript-first: callers pass invocation witnesses captured during multi-party
+    inference. Legacy keyword arguments are accepted so old callers fail with a clear
+    no-records result instead of importing removed proof backends.
+    """
+
+    import time
+
+    start = time.time()
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    proofs = 0
+    total_params = 0
+
+    record_list = list(records or [])
+    if not record_list:
+        raise ProofContractError(
+            "native ZKLoRA proof generation requires captured invocation records"
+        )
+
+    for record in record_list:
+        write_invocation_artifacts(output_dir, record)
+        total_params += record.rank * record.in_dim + record.out_dim * record.rank
+        proofs += 1
+        if verbose:
+            print(
+                f"Generated native ZKLoRA proof artifact for "
+                f"{record.module_name}#{record.invocation_index}"
+            )
+
+    elapsed = time.time() - start
+    return (0.0, 0.0, elapsed, total_params, proofs)
 
 
 def batch_verify_proofs(
-    proof_dir: str = "proof_artifacts", verbose: bool = False
-) -> tuple[float, int]:
-    """Batch verifies proofs for all ONNX models in the specified directory.
-
-    Args:
-        onnx_dir: Directory containing ONNX model files
-        proof_dir: Directory containing proof artifacts (proofs, verification keys, etc.)
-
-    ## Returns:
-        tuple[float, int]: Total time spent verifying proofs, number of proofs verified
-    """
-    proof_files = glob.glob(os.path.join(proof_dir, "*.pf"))
-    if not proof_files:
-        print(f"No proof files found in {proof_dir}.")
-        return 0.0, 0  # or return None
-
-    total_verify_time = 0.0
-
-    for proof_file in proof_files:
-        base_name = os.path.splitext(os.path.basename(proof_file))[0]
-        names = resolve_proof_paths(proof_dir, base_name)
-        if names is None:
-            continue
-        # Only unpack the variables we need
-        paths = names  # more descriptive variable name
-
-        print(f"Verifying proof for {base_name}...")
-        start_time = time.time()
-        verify_ok = ezkl.verify(
-            paths.proof, paths.settings, paths.verification_key, paths.srs
-        )
-        end_time = time.time()
-
-        duration = end_time - start_time
-        total_verify_time += duration
-        if verbose:
-            print(f"Verification took {duration:.2f} seconds")
-
-        if verify_ok:
-            if verbose:
-                print(f"Proof verified successfully for {base_name}!\n")
-        else:
-            if verbose:
-                print(f"Verification failed for {base_name}.\n")
-
-    print(f"Total proofs verified: {len(proof_files)}")
-    return total_verify_time, len(proof_files)
-
-
-async def generate_proofs(
-    onnx_dir: str = "lora_onnx_params",
-    json_dir: str = "intermediate_activations",
-    output_dir: str = "proof_artifacts",
+    proof_dir: str = "proof_artifacts",
+    transcript: str | Iterable[TranscriptEntry] | None = None,
+    expected_adapters=None,
     verbose: bool = False,
-) -> Optional[tuple[float, float, float, int, int]]:
-    """Asynchronously scans onnx_dir for .onnx files and json_dir for .json files.
-    For each matching pair, runs:
-    1) gen_settings + compile_circuit
-    2) gen_srs + setup
-    3) gen_witness (async)
-    4) prove
+) -> tuple[float, int]:
+    """Verify native ZKLoRA proof artifacts against the base user's transcript."""
 
-    Args:
-        onnx_dir: Directory containing ONNX model files
-        json_dir: Directory containing input JSON files
-        output_dir: Directory to store proof artifacts (default: current directory)
-
-    Returns:
-        - total_settings_time: Total time spent on settings/setup
-        - total_witness_time: Total time spent generating witnesses
-        - total_prove_time: Total time spent generating proofs
-        - count_onnx_files: Number of ONNX files successfully processed
-    """
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    onnx_files = glob.glob(os.path.join(onnx_dir, "*.onnx"))
-    if not onnx_files:
-        print(f"No ONNX files found in {onnx_dir}.")
-        return
-
-    if verbose:
-        print(f"Found {len(onnx_files)} ONNX files in {onnx_dir}.")
-
-    total_settings_time = 0
-    total_witness_time = 0
-    total_prove_time = 0
-    count_onnx_files = 0
-    total_params = 0
-    print("Processing ONNX files for proof generation...")
-    for onnx_path in onnx_files:
-        base_name = os.path.splitext(os.path.basename(onnx_path))[0]
-        json_path = os.path.join(json_dir, base_name + ".json")
-        if not os.path.isfile(json_path):
-            print(f"No matching JSON for {onnx_path}, skipping.")
-            continue
-
-        if verbose:
-            print("==========================================")
-            print(f"Preparing to prove with ONNX: {onnx_path}")
-            print(f"Matching JSON: {json_path}")
-
-        onnx_model = onnx.load(onnx_path)
-        param_count = sum(np.prod(param.dims) for param in onnx_model.graph.initializer)
-        if verbose:
-            print(f"Number of parameters: {param_count:,}")
-        total_params += param_count
-
-        names = resolve_proof_paths(output_dir, base_name)
-        if names is None:
-            continue
-        (
-            circuit_name,
-            settings_file,
-            srs_file,
-            vk_file,
-            pk_file,
-            witness_file,
-            proof_file,
-        ) = names
-
-        py_args = ezkl.PyRunArgs()
-        py_args.input_visibility = "public"
-        py_args.output_visibility = "public"
-        py_args.param_visibility = "private"
-        py_args.logrows = 20
-
-        if verbose:
-            print("Generating settings & compiling circuit...")
-        start_time = time.time()
-
-        # 1) gen_settings + compile_circuit
-        ezkl.gen_settings(onnx_path, settings_file, py_run_args=py_args)
-        ezkl.compile_circuit(onnx_path, circuit_name, settings_file)
-
-        # 2) SRS + setup
-        if not os.path.isfile(srs_file):
-            ezkl.gen_srs(srs_file, py_args.logrows)
-        ezkl.setup(circuit_name, vk_file, pk_file, srs_file)
-        end_time = time.time()
-        if verbose:
-            print(f"Setup for {base_name} took {end_time - start_time:.2f} sec")
-        total_settings_time += end_time - start_time
-
-        # Local check
-        with open(json_path, "r") as f:
-            data = json.load(f)
-        input_array = np.array(data["input_data"], dtype=np.float32)
-        if verbose:
-            print("Input shape from JSON:", input_array.shape)
-        session = onnxruntime.InferenceSession(onnx_path)
-        out = session.run(None, {"input_x": input_array})
-        if verbose:
-            print("Local ONNX output shape:", out[0].shape)
-
-        # 3) gen_witness (async via background thread)
-        if verbose:
-            print("Generating witness (async)...")
-        start_time = time.time()
-        try:
-            # Offload blocking ezkl.gen_witness call to a worker thread so that
-            # the async event loop can continue making progress.
-            await asyncio.to_thread(
-                ezkl.gen_witness,
-                data=json_path,
-                model=circuit_name,
-                output=witness_file,
-            )
-        except RuntimeError as e:
-            print(f"Failed to generate witness: {e}")
-            continue
-
-        if not ezkl.mock(witness_file, circuit_name):
-            print("Mock run failed, skipping.")
-            continue
-
-        end_time = time.time()
-        if verbose:
-            print(f"Witness gen took {end_time - start_time:.2f} sec")
-        total_witness_time += end_time - start_time
-        # 4) prove
-        if verbose:
-            print("Generating proof...")
-        start_time = time.time()
-        prove_ok = ezkl.prove(
-            witness_file, circuit_name, pk_file, proof_file, "single", srs_file
+    if transcript is None:
+        raise ProofContractError(
+            "native ZKLoRA verification requires the base user's transcript"
         )
-        end_time = time.time()
-        if verbose:
-            print(f"Proof gen took {end_time - start_time:.2f} sec")
-        total_prove_time += end_time - start_time
-
-        if not prove_ok:
-            print(f"Proof generation failed for {base_name}")
-            continue
-
-        if verbose:
-            print(f"Done with {base_name}.\n")
-        os.remove(pk_file)
-        count_onnx_files += 1
-
-    return (
-        total_settings_time,
-        total_witness_time,
-        total_prove_time,
-        total_params,
-        count_onnx_files,
-    )
+    if expected_adapters is None:
+        raise ProofContractError(
+            "native ZKLoRA verification requires a pre-inference adapter manifest"
+        )
+    total_time, count = verify_artifacts(proof_dir, transcript, expected_adapters)
+    if verbose:
+        print(f"Verified {count} native ZKLoRA proof artifacts in {total_time:.2f}s")
+    return total_time, count

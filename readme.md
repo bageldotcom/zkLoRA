@@ -28,7 +28,11 @@ Low-Rank Adaptation (LoRA) is a widely adopted method for customizing large-scal
 1. **Base Model User Verification**: The user must confirm that the LoRA weights are effective when paired with the intended base model.
 2. **LoRA Contributor Protection**: The contributor must keep their proprietary LoRA weights private until compensation is assured.
 
-To solve this, we created **ZKLoRA** a zero-knowledge verification protocol that relies on polynomial commitments, succinct proofs, and multi-party inference to verify LoRA–base model compatibility without exposing LoRA weights. With ZKLoRA, verification of LoRA modules takes just 1-2 seconds, even for state-of-the-art language models with tens of billions of parameters.
+To solve this, we created **ZKLoRA** a zero-knowledge verification protocol that relies on commitments, succinct proofs, and multi-party inference to verify exact LoRA delta computation for a pre-agreed adapter without exposing LoRA weights.
+
+This implementation uses a native Halo2 backend for transcript-bound proof artifacts. The v2 proof contract verifies exact quantized LoRA delta correctness for the statement the base user actually sent and received, and binds the proof to a pre-inference adapter manifest. It does not claim an end-to-end proof that the base model computed those activations.
+
+Verifier trust boundary: `expected_adapters` must be obtained and pinned by the verifier out-of-band before inference starts, for example by recording the exact manifest file or digest. A contributor-generated adapter manifest is only a convenience handoff artifact; if it is first generated after inference or supplied only alongside proofs, it is not trusted verifier input.
 
 For detailed information about this research, please refer to [our paper](https://arxiv.org/abs/2501.13965).
 
@@ -43,6 +47,7 @@ pip install zklora
 
 Use `src/scripts/lora_contributor_sample_script.py` to:
 - Host LoRA submodules
+- Write a pre-inference adapter manifest for the verifier to pin out-of-band
 - Handle inference requests
 - Generate proof artifacts
 
@@ -51,20 +56,40 @@ import argparse
 import threading
 import time
 
-from zklora import LoRAServer, AServerTCP
+from zklora import LoRAServer, LoRAServerSocket
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a sample LoRA contributor server and write the adapter manifest "
+            "that the verifier should pin out-of-band before inference."
+        )
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port_a", type=int, default=30000)
     parser.add_argument("--base_model", default="distilgpt2")
     parser.add_argument("--lora_model_id", default="ng0-k1/distilgpt2-finetuned-es")
     parser.add_argument("--out_dir", default="a-out")
+    parser.add_argument(
+        "--adapter_manifest",
+        default="adapter-manifest.json",
+        help=(
+            "Convenience manifest handoff path. The verifier must obtain and pin "
+            "this manifest out-of-band before inference; a post-inference manifest "
+            "is not trusted expected_adapters input."
+        ),
+    )
     args = parser.parse_args()
 
     stop_event = threading.Event()
     server_obj = LoRAServer(args.base_model, args.lora_model_id, args.out_dir)
-    t = AServerTCP(args.host, args.port_a, server_obj, stop_event)
+    server_obj.write_adapter_manifest(args.adapter_manifest)
+    print(f"[A-Server] wrote adapter manifest => {args.adapter_manifest}")
+    print(
+        "[A-Server] verifier must pin this manifest out-of-band before inference; "
+        "post-inference manifests are not trusted expected_adapters."
+    )
+    t = LoRAServerSocket(args.host, args.port_a, server_obj, stop_event)
     t.start()
 
     try:
@@ -123,9 +148,10 @@ def main():
     loss_val = client.forward_loss(text)
     print(f"[B] final loss => {loss_val:.4f}")
 
-    # End inference => A finalizes proofs offline
+    # End inference => A finalizes native ZKLoRA proof artifacts
     client.end_inference()
-    print("[B] done. B can now fetch proof files from A and verify them offline.")
+    client.transcript.write("b-transcript.json")
+    print("[B] done. B can now fetch proof files from A and verify them against b-transcript.json and the pre-agreed adapter manifest.")
 
 if __name__=="__main__":
     main()
@@ -135,13 +161,15 @@ if __name__=="__main__":
 
 Use `src/scripts/verify_proofs.py` to validate the proof artifacts:
 
+`--expected_adapters` must point to the verifier's pinned pre-inference adapter manifest. Do not accept a contributor manifest that was generated after inference, or first delivered with the proof bundle, as trusted verifier input; it is useful only as a handoff artifact to compare against the pinned expectation.
+
 ```python
 #!/usr/bin/env python3
 """
 Verify LoRA proof artifacts in a given directory.
 
 Example usage:
-  python verify_proofs.py --proof_dir a-out --verbose
+  python verify_proofs.py --proof_dir a-out --transcript b-transcript.json --expected_adapters adapter-manifest.json --verbose
 """
 
 import argparse
@@ -155,7 +183,22 @@ def main():
         "--proof_dir",
         type=str,
         default="proof_artifacts",
-        help="Directory containing proof files (.pf), plus settings, vk, srs."
+        help="Directory containing native .zklora proof artifacts."
+    )
+    parser.add_argument(
+        "--transcript",
+        type=str,
+        required=True,
+        help="Base user transcript JSON captured during inference."
+    )
+    parser.add_argument(
+        "--expected_adapters",
+        type=str,
+        required=True,
+        help=(
+            "Verifier-pinned pre-inference adapter manifest JSON. This must be "
+            "obtained out-of-band before inference, not first supplied with proofs."
+        )
     )
     parser.add_argument(
         "--verbose",
@@ -166,6 +209,8 @@ def main():
 
     total_verify_time, num_proofs = batch_verify_proofs(
         proof_dir=args.proof_dir,
+        transcript=args.transcript,
+        expected_adapters=args.expected_adapters,
         verbose=args.verbose
     )
     print(f"Done verifying {num_proofs} proofs. Total time: {total_verify_time:.2f}s")
@@ -300,19 +345,19 @@ For detailed information about the codebase organization and implementation deta
 
 <table>
 <tr>
-<td>✓</td><td><strong>Trust-Minimized Verification:</strong> Zero-knowledge proofs enable secure LoRA validation</td>
+<td>✓</td><td><strong>Trust-Minimized Delta Verification:</strong> Zero-knowledge proofs validate exact quantized LoRA deltas for a pre-agreed adapter</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Rapid Verification:</strong> 1-2 second processing per module, even for billion-parameter models</td>
+<td>✓</td><td><strong>Native Halo2 Backend:</strong> Proofs no longer depend on EZKL/ONNX artifacts</td>
 </tr>
 <tr>
 <td>✓</td><td><strong>Multi-Party Inference:</strong> Protected activation exchange between parties</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Complete Privacy:</strong> LoRA weights remain confidential while ensuring compatibility</td>
+<td>✓</td><td><strong>Adapter Weight Privacy:</strong> LoRA weights remain confidential while the committed adapter identity is checked</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Production Ready:</strong> Efficiently scales to handle multiple LoRA modules</td>
+<td>✓</td><td><strong>Benchmark Required:</strong> Real-shape proving and verification performance should be measured for each deployment target</td>
 </tr>
 </table>
 
@@ -328,8 +373,7 @@ ZKLoRA is built upon these outstanding open source projects:
 | [Transformers](https://github.com/huggingface/transformers) | State-of-the-art Natural Language Processing |
 | [dusk-merkle](https://github.com/dusk-network/dusk-merkle) | Merkle tree implementation in Rust |
 | [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) | Cryptographic hash function |
-| [EZKL](https://github.com/zkonduit/ezkl) | Zero-knowledge proof system for neural networks |
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Cross-platform ML model inference |
+| [Halo2](https://github.com/zcash/halo2) | Native zero-knowledge proving system used by the ZKLoRA backend |
 
 <hr>
 

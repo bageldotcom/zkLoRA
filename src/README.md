@@ -13,8 +13,9 @@ src/
 │   ├── lora_contributor_mpi/   # Server implementation (User A)
 │   ├── libs/
 │   │   └── merkle/            # Rust Merkle tree implementation
-│   ├── mpi_lora_onnx_exporter.py  # ONNX export utilities
-│   └── zk_proof_generator.py   # Proof generation core
+│   ├── proof_contract.py       # Transcript and artifact contract
+│   └── zk_proof_generator.py   # Native proof generation core
+├── src/lib.rs                  # Halo2/PyO3 native prover
 ├── scripts/                    # Sample usage scripts
 ├── pyproject.toml             # Build configuration
 └── requirements.txt           # Dependencies
@@ -24,17 +25,20 @@ src/
 
 ### Zero-Knowledge Architecture
 
-The zero-knowledge proof system in ZKLoRA is built on polynomial commitments and succinct proofs. The `zk_proof_generator.py` module orchestrates the proof generation process by:
+The zero-knowledge proof system in ZKLoRA is built on transcript-bound LoRA delta statements and native Halo2 proofs. The `zk_proof_generator.py` module orchestrates the proof generation process by:
 
-1. Converting LoRA modules to ONNX format using `mpi_lora_onnx_exporter.py`
-2. Computing Merkle roots of model activations via `activations_commit.py`
-3. Generating zero-knowledge proofs that validate LoRA compatibility
+1. Capturing the base user's local transcript of activations and returned LoRA deltas
+2. Binding each proof to a verifier-pinned pre-inference adapter manifest with a Poseidon adapter commitment
+3. Generating native `.zklora.*` proof artifacts for contributor-side LoRA invocations
+4. Verifying proof artifacts against both the base user's transcript and expected adapter manifest before accepting a module
+
+The verifier must obtain and pin `expected_adapters` out-of-band before inference starts. Contributor-generated adapter manifests are convenience handoff artifacts only; if a manifest is generated after inference or first delivered alongside proofs, it is not trusted to define the expected adapter.
 
 ### Multi-Party Inference Protocol
 
-The MPI system enables secure interaction between the base model user (B) and LoRA provider (A) through:
+The MPI system enables interaction between the base model user (B) and LoRA provider (A) through:
 
-- Encrypted communication channels for activation exchange
+- Length-prefixed JSON messages for activation exchange
 - Asynchronous proof generation that doesn't block inference
 - Efficient state management for handling multiple concurrent sessions
 
@@ -52,12 +56,7 @@ The Rust implementation is wrapped with Python bindings in the `libs/merkle` dir
 
 ### Performance Considerations
 
-ZKLoRA achieves its 1-2 second verification time through:
-
-- Parallel proof generation for multiple LoRA modules
-- Optimized ONNX conversions that minimize computational overhead
-- Efficient Merkle tree implementations in Rust
-- Careful memory management during large model operations
+Native Halo2 performance should be measured for the specific LoRA shapes being proven. The v2 implementation prioritizes proof-contract correctness, transcript binding, and pre-agreed adapter binding before publishing benchmark claims.
 
 For detailed usage examples and high-level architecture, please refer to the [main README](../../README.md) in the project root.
 
@@ -73,7 +72,7 @@ For detailed usage examples and high-level architecture, please refer to the [ma
 
 ### Zero-Knowledge Components
 - `zk_proof_generator.py`: Core proof generation and verification
-- `mpi_lora_onnx_exporter.py`: ONNX export utilities for proof generation
+- `proof_contract.py`: Canonical transcript, statement, metadata, and artifact schemas
 - `activations_commit.py`: Merkle tree interface for model commitments
 
 ### Build & Distribution
@@ -110,8 +109,12 @@ server.list_lora_injection_points()
 from zklora import batch_verify_proofs
 
 verify_time, num_proofs = batch_verify_proofs(
-    proof_dir="proof_artifacts"
+    proof_dir="proof_artifacts",
+    transcript="b-transcript.json",
+    expected_adapters="adapter-manifest.json",
 )
 ```
+
+In this example, `adapter-manifest.json` is the verifier's pre-inference pinned copy or digest-matched file, not a manifest first generated after inference.
 
 For detailed implementation information, please refer to the individual module documentation. 

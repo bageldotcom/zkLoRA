@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.13,<2"]
+build-backend = "maturin"
 
 [project]
 name = "zklora"
@@ -21,9 +21,6 @@ dependencies = [
     "torch>=2.0.0",
     "transformers>=4.30.0",
     "peft>=0.4.0",
-    "onnx>=1.14.0",
-    "onnxruntime>=1.15.0",
-    "ezkl>=5.0.0",
     "blake3>=0.4.0",
 ]
 
@@ -38,5 +35,7 @@ dev = [
 "Homepage" = "https://github.com/bagel-org/zklora"
 "Bug Tracker" = "https://github.com/bagel-org/zklora/issues"
 
-[tool.hatch.build.targets.wheel]
-packages = ["zklora"]  # Update path since we're now in src/ 
+[tool.maturin]
+features = ["extension-module"]
+python-source = "."
+module-name = "zklora._native_prover"

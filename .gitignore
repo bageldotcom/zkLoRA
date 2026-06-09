@@ -46,5 +46,8 @@ dist/
 build/
 *.egg
 *.whl
+*.so
+*.dylib
+*.pyd
 .pypirc
 .coverage
