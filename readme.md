@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="bagel-logo.png" alt="Bagel Logo" width="200"/>
+  <img src="bagel-logo.png" alt="Bagel Labs logo" width="520"/>
 </p>
 
 <p align="center">
