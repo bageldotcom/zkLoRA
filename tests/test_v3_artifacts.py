@@ -269,6 +269,21 @@ def test_transcript_tamper_and_reorder_rejected(tmp_path, monkeypatch):
         )
 
 
+def test_duplicate_transcript_rows_rejected(tmp_path, monkeypatch):
+    records = _records(1)
+    payload = _v3_manifest()
+    out_dir = _generate(tmp_path, records, payload, chunk=1, monkeypatch=monkeypatch)
+
+    transcript = _transcript(records)
+    duplicate = replace(transcript[0], x=[transcript[0].x[0] + 1, *transcript[0].x[1:]])
+    with pytest.raises(ProofContractError, match="duplicate transcript row"):
+        batch_verify_proofs(
+            proof_dir=str(out_dir),
+            transcript=[duplicate, *transcript],
+            expected_adapters=payload,
+        )
+
+
 def test_zero_artifact_module_reported_missing(tmp_path, monkeypatch):
     records = _records(2)
     payload = _v3_manifest()

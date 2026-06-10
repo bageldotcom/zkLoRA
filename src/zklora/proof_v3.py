@@ -982,6 +982,18 @@ def _transcript_rows_for_statement(
     return rows
 
 
+def _unique_transcript_index(
+    entries: Iterable[TranscriptEntry],
+) -> dict[tuple[str, str, int], TranscriptEntry]:
+    index: dict[tuple[str, str, int], TranscriptEntry] = {}
+    for entry in entries:
+        key = entry.key()
+        if key in index:
+            raise ProofContractError(f"duplicate transcript row for {key}")
+        index[key] = entry
+    return index
+
+
 def verify_v3_artifact_set(
     statement_path: str | os.PathLike[str],
     transcript_index: dict[tuple[str, str, int], TranscriptEntry],
@@ -1210,9 +1222,13 @@ def check_coverage(
 ) -> None:
     transcript_keys: dict[tuple[str, str], set[int]] = {}
     for entry in transcript_entries:
-        transcript_keys.setdefault((entry.session_id, entry.module_name), set()).add(
-            int(entry.invocation_index)
-        )
+        key = (entry.session_id, entry.module_name)
+        indices = transcript_keys.setdefault(key, set())
+        index = int(entry.invocation_index)
+        if index in indices:
+            duplicate = (entry.session_id, entry.module_name, index)
+            raise ProofContractError(f"duplicate transcript row for {duplicate}")
+        indices.add(index)
 
     claim_keys: dict[tuple[str, str], list[CoverageClaim]] = {}
     for claim in claims:
@@ -1257,7 +1273,7 @@ def expand_statement_rows(
             "schema-3 statements are digest-only; pass the verifier transcript"
         )
     entries = load_transcript(transcript)
-    index = {entry.key(): entry for entry in entries}
+    index = _unique_transcript_index(entries)
     return _transcript_rows_for_statement(statement, index)
 
 
@@ -1274,7 +1290,7 @@ def verify_artifacts_mixed(
     start = time.time()
     reject_secrets_in_artifact_dir(proof_dir)
     entries = load_transcript(transcript)
-    transcript_index = {entry.key(): entry for entry in entries}
+    transcript_index = _unique_transcript_index(entries)
     adapters_index = load_expected_adapters_any(expected_adapters)
     v2_index = _adapters_index_for_v2(adapters_index)
 

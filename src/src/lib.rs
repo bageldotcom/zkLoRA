@@ -1328,7 +1328,9 @@ static LEGACY_PARAMS_CACHE: OnceLock<Mutex<BoundedLru<u32, Arc<Params<EqAffine>>
 /// bookkeeping), so a panic in another thread cannot leave them torn;
 /// recover from poisoning instead of propagating panics through PyO3.
 fn lock_recovering<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn legacy_cache() -> &'static Mutex<BoundedLru<LegacyShapeKey, Arc<LegacyKeys>>> {
@@ -1336,8 +1338,8 @@ fn legacy_cache() -> &'static Mutex<BoundedLru<LegacyShapeKey, Arc<LegacyKeys>>>
 }
 
 fn legacy_params_for(k: u32) -> Arc<Params<EqAffine>> {
-    let cache =
-        LEGACY_PARAMS_CACHE.get_or_init(|| Mutex::new(BoundedLru::new(MAX_LEGACY_PARAMS_CACHE_ENTRIES)));
+    let cache = LEGACY_PARAMS_CACHE
+        .get_or_init(|| Mutex::new(BoundedLru::new(MAX_LEGACY_PARAMS_CACHE_ENTRIES)));
     if let Some(found) = lock_recovering(cache).get(&k) {
         return found;
     }
@@ -1382,8 +1384,7 @@ fn legacy_keys_for(circuit: &LoraCircuit, need_pk: bool) -> Result<Arc<LegacyKey
     let empty = circuit.without_witnesses();
     let vk = keygen_vk(&params, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
     let entry = if need_pk {
-        let pk =
-            keygen_pk(&params, vk, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
+        let pk = keygen_pk(&params, vk, &empty).map_err(|e| NativeError::Halo2(e.to_string()))?;
         Arc::new(LegacyKeys::Prover { params, pk })
     } else {
         Arc::new(LegacyKeys::VerifyOnly { params, vk })
