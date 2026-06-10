@@ -18,7 +18,7 @@ and `python benchmarks/run_benchmarks.py`.
 | 8×2×8   | ~18 | >290 s (timed out) | — | 13 | 6.0 s | 1.4 s | 0.034 s | >200× |
 | 16×2×16 | ~19 | est. >370 s | — | 14 | 27.2 s | 7.0 s | 0.16 s | >50× |
 | 64×4×64 | ~22 | infeasible | — | 17 | 47.2 s | 10.8 s | 0.22 s | n/a (was infeasible) |
-| 768×2×256 | ~24 | infeasible | — | 19 | see below | see below | see below | n/a (was infeasible) |
+| 768×2×256 | ~23 | infeasible (est. ~190 GB) | — | 19 | 429 s | 81 s | 1.3 s (17.1 s cold) | n/a (was infeasible) |
 | 768×4×768 | ~25 | infeasible | — | 20 | needs >15 GB RAM host | — | — | n/a |
 | 768×4×2304 | ~26 | infeasible (est. >200 GB params/pk) | — | 21 | needs >15 GB RAM host | — | — | n/a |
 
@@ -51,6 +51,7 @@ four fixed-point configs).
 
 Proving memory is dominated by halo2 extended-domain evaluations (Poseidon
 gate degree ⇒ 8× extended domain), and halo2 0.3 keeps all advice cosets
-resident during create_proof. Measured: k=20 and k=21 shapes exceed a 15 GB
-host (OOM); plan on 32–64 GB for 768-dim × 4-rank modules with wide outputs.
+resident during create_proof. Measured: 12.1 GB peak at k=19 (768×2×256);
+k=20 and k=21 shapes exceed a 15 GB host (OOM-killed); plan on 32–64 GB for
+768-dim × 4-rank modules with wide outputs.
 The proving-key cache holds up to `ZKLORA_PK_CACHE_CAP` (default 2) shapes.

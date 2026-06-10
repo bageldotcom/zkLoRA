@@ -67,7 +67,7 @@ Proofs and verifying keys from the v2 backend are not compatible with v3 (the `b
 
 Measured on a 4-core machine (warm key cache): a 2×1×2 relation proves in ~0.7s and verifies in ~0.02s (previously ~23s / ~18s), an 8×2×8 relation proves in ~1.4s (previously >5 minutes), and the real 768×4×2304 c_attn shape becomes feasible at k=21.
 
-Memory note: proving memory is dominated by halo2's extended-domain evaluations (the Poseidon chip's gate degree implies an 8× extended domain), and halo2 0.3 keeps all advice cosets resident during proof creation. Measured on a 15 GB host: k≤19 circuits prove comfortably, while k=20 and k=21 shapes (e.g. 768×4×768 and the full 768×4×2304 c_attn) exceed 15 GB and require a 32–64 GB prover host. Verification is lightweight once the verifying key is cached.
+Memory note: proving memory is dominated by halo2's extended-domain evaluations (the Poseidon chip's gate degree implies an 8× extended domain), and halo2 0.3 keeps all advice cosets resident during proof creation. Measured on a 15 GB host: a k=19 shape (768×2×256) proves in 81 s warm with a 12.1 GB peak, while k=20 and k=21 shapes (e.g. 768×4×768 and the full 768×4×2304 c_attn) exceed 15 GB and require a 32–64 GB prover host. Verification is lightweight once the verifying key is cached.
 
 For detailed usage examples and high-level architecture, please refer to the [main README](../../README.md) in the project root.
 
