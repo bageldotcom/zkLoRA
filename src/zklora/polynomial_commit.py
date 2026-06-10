@@ -4,6 +4,11 @@ from typing import List, Union
 
 from blake3 import blake3  # type: ignore
 
+try:  # native fast path; byte-identical to the Python implementation below
+    from zklora import _native_prover as _native_merkle_module
+except ImportError:  # pragma: no cover - extension not built in this env
+    _native_merkle_module = None
+
 # Merkle-based vector commitment parameters
 LEAF_EMPTY = b"\x00" * 32  # same as EMPTY_HASH in Rust implementation
 
@@ -45,6 +50,18 @@ def _merkle_root(values: List[Union[int, float]], nonce: bytes) -> bytes:
     """
     if not values:
         return LEAF_EMPTY
+
+    if _native_merkle_module is not None and hasattr(
+        _native_merkle_module, "merkle_root"
+    ):
+        try:
+            return bytes(
+                _native_merkle_module.merkle_root(
+                    [float(v) for v in values], bytes(nonce)
+                )
+            )
+        except (OverflowError, TypeError, ValueError):
+            pass  # fall back to the pure-Python implementation
 
     # Convert to leaf hashes with nonce
     level: List[bytes] = [_hash_leaf(v, nonce) for v in values]

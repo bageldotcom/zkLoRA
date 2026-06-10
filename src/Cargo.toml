@@ -13,6 +13,7 @@ python = ["dep:pyo3"]
 extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
+blake3 = "1"
 halo2_proofs = "0.3.2"
 halo2_gadgets = "0.5"
 ff = "0.13"
