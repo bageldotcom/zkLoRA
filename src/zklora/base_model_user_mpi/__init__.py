@@ -11,8 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from ..proof_contract import (
     FixedPointConfig,
     TranscriptEntry,
-    flatten,
-    quantize_nested,
+    quantize_rows,
     write_transcript,
 )
 
@@ -242,10 +241,7 @@ class ProofTranscriptRecorder:
                 f"{len(x_rows)} inputs vs {len(delta_rows)} deltas"
             )
         if q_delta_values is None:
-            q_delta_rows = [
-                flatten(quantize_nested(delta_row, self.fixed_point))
-                for delta_row in delta_rows
-            ]
+            q_delta_rows = quantize_rows(delta_rows, self.fixed_point)
         else:
             q_delta_rows = _canonical_int_rows(q_delta_values)
         if len(x_rows) != len(q_delta_rows):
@@ -253,11 +249,11 @@ class ProofTranscriptRecorder:
                 f"transcript row mismatch for {module_name}: "
                 f"{len(x_rows)} inputs vs {len(q_delta_rows)} q_deltas"
             )
+        q_x_rows = quantize_rows(x_rows, self.fixed_point)
         entries: list[TranscriptEntry] = []
-        for x_row, q_delta in zip(x_rows, q_delta_rows):
+        for q_x, q_delta in zip(q_x_rows, q_delta_rows):
             invocation_index = self._counts.get(module_name, 0)
             self._counts[module_name] = invocation_index + 1
-            q_x = flatten(quantize_nested(x_row, self.fixed_point))
             entry = TranscriptEntry(
                 session_id=self.session_id,
                 module_name=module_name,

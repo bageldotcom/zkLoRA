@@ -20,6 +20,7 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
 use rand_core::OsRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -1474,21 +1475,25 @@ pub fn statement_digest_hex(statement_json: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Exact integer LoRA delta computation mirroring
-/// `proof_contract.compute_delta_quantized`. All arithmetic uses checked i128
-/// operations; any overflow or bound violation is reported as an error so the
-/// Python caller can fall back to its arbitrary-precision implementation. The
-/// rounding rule is the same canonical half-up floor division used in-circuit.
-pub fn compute_delta_quantized_native(
+/// Shared validation/bounds context for the exact integer delta fast path.
+struct DeltaContext {
+    in_dim: usize,
+    value_bound: i128,
+    intermediate_bound: i128,
+    scale: i128,
+    scaling_num: i64,
+    scaling_den: i64,
+}
+
+fn delta_context(
     a: &[Vec<i64>],
     b: &[Vec<i64>],
-    x: &[i64],
     scaling_num: i64,
     scaling_den: i64,
     scale_bits: u32,
     value_bits: u32,
     intermediate_bits: u32,
-) -> Result<Vec<i64>, NativeError> {
+) -> Result<DeltaContext, NativeError> {
     if scaling_den <= 0 {
         return Err(NativeError::InvalidDimensions(
             "scaling_den must be positive".into(),
@@ -1511,13 +1516,6 @@ pub fn compute_delta_quantized_native(
         ));
     }
     let in_dim = a[0].len();
-    let out_dim = b.len();
-    if x.len() != in_dim {
-        return Err(NativeError::InvalidDimensions(format!(
-            "x expected length {in_dim}, got {}",
-            x.len()
-        )));
-    }
     for row in a {
         if row.len() != in_dim {
             return Err(NativeError::InvalidDimensions(
@@ -1533,25 +1531,47 @@ pub fn compute_delta_quantized_native(
         }
     }
     let value_bound = (1i128 << (value_bits - 1)) - 1;
-    let intermediate_bound = (1i128 << (intermediate_bits - 1)) - 1;
-    let scale = 1i128 << scale_bits;
-    let check_value = |value: i64, label: &str| -> Result<(), NativeError> {
-        let value = value as i128;
-        if value < -value_bound || value > value_bound {
-            return Err(NativeError::InvalidDimensions(format!(
-                "{label} value {value} exceeds signed bound +/-{value_bound}"
-            )));
-        }
-        Ok(())
-    };
-    for value in x {
-        check_value(*value, "x")?;
-    }
     for value in a.iter().flatten() {
-        check_value(*value, "A")?;
+        check_native_bound(*value, value_bound, "A")?;
     }
     for value in b.iter().flatten() {
-        check_value(*value, "B")?;
+        check_native_bound(*value, value_bound, "B")?;
+    }
+    Ok(DeltaContext {
+        in_dim,
+        value_bound,
+        intermediate_bound: (1i128 << (intermediate_bits - 1)) - 1,
+        scale: 1i128 << scale_bits,
+        scaling_num,
+        scaling_den,
+    })
+}
+
+fn check_native_bound(value: i64, bound: i128, label: &str) -> Result<(), NativeError> {
+    let value = value as i128;
+    if value < -bound || value > bound {
+        return Err(NativeError::InvalidDimensions(format!(
+            "{label} value {value} exceeds signed bound +/-{bound}"
+        )));
+    }
+    Ok(())
+}
+
+fn delta_for_row(
+    ctx: &DeltaContext,
+    a: &[Vec<i64>],
+    b: &[Vec<i64>],
+    x: &[i64],
+) -> Result<Vec<i64>, NativeError> {
+    if x.len() != ctx.in_dim {
+        return Err(NativeError::InvalidDimensions(format!(
+            "x expected length {}, got {}",
+            ctx.in_dim,
+            x.len()
+        )));
+    }
+    for value in x {
+        check_native_bound(*value, ctx.value_bound, "x")?;
     }
 
     let overflow =
@@ -1562,7 +1582,7 @@ pub fn compute_delta_quantized_native(
         n.div_euclid(denominator)
     };
 
-    let mut intermediate = Vec::with_capacity(rank);
+    let mut intermediate = Vec::with_capacity(a.len());
     for row in a {
         let mut raw: i128 = 0;
         for (weight, x_i) in row.iter().zip(x.iter()) {
@@ -1571,39 +1591,202 @@ pub fn compute_delta_quantized_native(
                 .ok_or_else(overflow)?;
             raw = raw.checked_add(product).ok_or_else(overflow)?;
         }
-        if raw < -intermediate_bound || raw > intermediate_bound {
+        if raw < -ctx.intermediate_bound || raw > ctx.intermediate_bound {
             return Err(NativeError::InvalidDimensions(format!(
-                "intermediate value {raw} exceeds signed bound +/-{intermediate_bound}"
+                "intermediate value {raw} exceeds signed bound +/-{}",
+                ctx.intermediate_bound
             )));
         }
-        intermediate.push(div_round(raw, scale));
+        intermediate.push(div_round(raw, ctx.scale));
     }
 
-    let mut delta = Vec::with_capacity(out_dim);
+    let mut delta = Vec::with_capacity(b.len());
     for row in b {
         let mut raw: i128 = 0;
         for (weight, value) in row.iter().zip(intermediate.iter()) {
             let product = (*weight as i128).checked_mul(*value).ok_or_else(overflow)?;
             raw = raw.checked_add(product).ok_or_else(overflow)?;
         }
-        if raw < -intermediate_bound || raw > intermediate_bound {
+        if raw < -ctx.intermediate_bound || raw > ctx.intermediate_bound {
             return Err(NativeError::InvalidDimensions(format!(
-                "intermediate value {raw} exceeds signed bound +/-{intermediate_bound}"
+                "intermediate value {raw} exceeds signed bound +/-{}",
+                ctx.intermediate_bound
             )));
         }
-        let rescaled = div_round(raw, scale);
+        let rescaled = div_round(raw, ctx.scale);
         let scaled = rescaled
-            .checked_mul(scaling_num as i128)
+            .checked_mul(ctx.scaling_num as i128)
             .ok_or_else(overflow)?;
-        let out = div_round(scaled, scaling_den as i128);
-        if out < -value_bound || out > value_bound {
+        let out = div_round(scaled, ctx.scaling_den as i128);
+        if out < -ctx.value_bound || out > ctx.value_bound {
             return Err(NativeError::InvalidDimensions(format!(
-                "delta value {out} exceeds signed bound +/-{value_bound}"
+                "delta value {out} exceeds signed bound +/-{}",
+                ctx.value_bound
             )));
         }
         delta.push(out as i64);
     }
     Ok(delta)
+}
+
+/// Exact integer LoRA delta computation mirroring
+/// `proof_contract.compute_delta_quantized`. All arithmetic uses checked i128
+/// operations; any overflow or bound violation is reported as an error so the
+/// Python caller can fall back to its arbitrary-precision implementation. The
+/// rounding rule is the same canonical half-up floor division used in-circuit.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_delta_quantized_native(
+    a: &[Vec<i64>],
+    b: &[Vec<i64>],
+    x: &[i64],
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> Result<Vec<i64>, NativeError> {
+    let ctx = delta_context(
+        a,
+        b,
+        scaling_num,
+        scaling_den,
+        scale_bits,
+        value_bits,
+        intermediate_bits,
+    )?;
+    delta_for_row(&ctx, a, b, x)
+}
+
+/// Batched variant: validates the adapter once and computes every row's delta
+/// in parallel. Semantics per row are identical to the single-row function.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_delta_rows_native(
+    a: &[Vec<i64>],
+    b: &[Vec<i64>],
+    xs: &[Vec<i64>],
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> Result<Vec<Vec<i64>>, NativeError> {
+    let ctx = delta_context(
+        a,
+        b,
+        scaling_num,
+        scaling_den,
+        scale_bits,
+        value_bits,
+        intermediate_bits,
+    )?;
+    xs.par_iter()
+        .map(|x| delta_for_row(&ctx, a, b, x))
+        .collect()
+}
+
+/// Exact fixed-point quantization of one decimal string, replicating
+/// `proof_contract.quantize_scalar`: the caller passes Python's `str(float)`
+/// output (the semantics anchor for quantization), and this routine computes
+/// `round_half_up_away_from_zero(decimal_value * 2^scale_bits)` in exact
+/// integer arithmetic. Rust's own float formatter is deliberately NOT used:
+/// it can pick a different shortest round-trip digit string than CPython's
+/// repr for the same f64, which would silently change quantized values.
+pub fn quantize_decimal_str_exact(
+    text: &str,
+    scale_bits: u32,
+    value_bits: u32,
+) -> Result<i64, NativeError> {
+    if value_bits == 0 || value_bits > 63 || scale_bits >= value_bits {
+        return Err(NativeError::InvalidDimensions(
+            "fixed-point bits outside native fast-path range".into(),
+        ));
+    }
+    let value_bound = (1i128 << (value_bits - 1)) - 1;
+
+    let bad = || NativeError::InvalidDimensions(format!("cannot quantize value {text:?}"));
+    let trimmed = text.trim();
+    let (negative, unsigned) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let (mantissa_text, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exp)) => (mantissa, exp.parse::<i32>().map_err(|_| bad())?),
+        None => (unsigned, 0),
+    };
+    let (int_text, frac_text) = match mantissa_text.split_once('.') {
+        Some((int_part, frac_part)) => (int_part, frac_part),
+        None => (mantissa_text, ""),
+    };
+    if int_text.is_empty() && frac_text.is_empty() {
+        return Err(bad());
+    }
+    let digits: String = format!("{int_text}{frac_text}");
+    if digits.is_empty() || digits.len() > 30 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        // Non-finite values ('inf'/'nan'), or more digits than the i128 fast
+        // path can hold: defer to the Python reference implementation.
+        return Err(bad());
+    }
+    let mantissa: i128 = digits.parse().map_err(|_| bad())?;
+    let pow10 = exponent
+        .checked_sub(frac_text.len() as i32)
+        .ok_or_else(bad)?;
+
+    let bound_err = || {
+        NativeError::InvalidDimensions(format!(
+            "quantized value of {text:?} exceeds signed bound +/-{value_bound}"
+        ))
+    };
+    let magnitude = if mantissa == 0 {
+        0i128
+    } else if pow10 >= 0 {
+        // Integral decimal value: scale exactly, no rounding needed.
+        let mut scaled = mantissa;
+        for _ in 0..pow10 {
+            scaled = scaled.checked_mul(10).ok_or_else(bound_err)?;
+        }
+        scaled
+            .checked_mul(1i128 << scale_bits)
+            .ok_or_else(bound_err)?
+    } else {
+        let k = -pow10 as u32;
+        // numerator = mantissa * 2^scale_bits, denominator = 10^k. With at
+        // most 30 mantissa digits the numerator can overflow i128 only via
+        // checked_mul (reported as out-of-fast-path); for k beyond i128's
+        // 10^38 capacity the quotient is zero when numerator < 10^k / 2.
+        let numerator = mantissa
+            .checked_mul(1i128 << scale_bits)
+            .ok_or_else(bound_err)?;
+        if k > 38 {
+            // 10^39 / 2 = 5e38 exceeds i128::MAX (~1.7e38), so any in-range
+            // numerator is strictly below half the denominator: rounds to 0.
+            0
+        } else {
+            let denominator = 10i128.pow(k);
+            (numerator + denominator / 2) / denominator
+        }
+    };
+    let signed = if negative { -magnitude } else { magnitude };
+    if signed < -value_bound || signed > value_bound {
+        return Err(NativeError::InvalidDimensions(format!(
+            "quantized value {signed} exceeds signed bound +/-{value_bound}"
+        )));
+    }
+    Ok(signed as i64)
+}
+
+/// Quantize whole rows in parallel with exact scalar semantics.
+pub fn quantize_rows_exact(
+    rows: &[Vec<String>],
+    scale_bits: u32,
+    value_bits: u32,
+) -> Result<Vec<Vec<i64>>, NativeError> {
+    rows.par_iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| quantize_decimal_str_exact(value, scale_bits, value_bits))
+                .collect()
+        })
+        .collect()
 }
 
 const MERKLE_EMPTY: [u8; 32] = [0u8; 32];
@@ -1616,7 +1799,7 @@ pub fn merkle_root_f64(values: &[f64], nonce: &[u8]) -> [u8; 32] {
         return MERKLE_EMPTY;
     }
     let mut level: Vec<[u8; 32]> = values
-        .iter()
+        .par_iter()
         .map(|value| {
             let mut hasher = blake3::Hasher::new();
             hasher.update(&value.to_be_bytes());
@@ -1628,13 +1811,15 @@ pub fn merkle_root_f64(values: &[f64], nonce: &[u8]) -> [u8; 32] {
         level.push(MERKLE_EMPTY);
     }
     while level.len() > 1 {
-        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len() / 2 + 1);
-        for pair in level.chunks_exact(2) {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&pair[0]);
-            hasher.update(&pair[1]);
-            next.push(*hasher.finalize().as_bytes());
-        }
+        let mut next: Vec<[u8; 32]> = level
+            .par_chunks_exact(2)
+            .map(|pair| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&pair[0]);
+                hasher.update(&pair[1]);
+                *hasher.finalize().as_bytes()
+            })
+            .collect();
         if next.len() % 2 == 1 && next.len() != 1 {
             next.push(MERKLE_EMPTY);
         }
@@ -1705,6 +1890,45 @@ fn compute_delta_quantized(
 
 #[cfg(feature = "python")]
 #[pyo3::pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn compute_delta_rows(
+    py: pyo3::Python<'_>,
+    a: Vec<Vec<i64>>,
+    b: Vec<Vec<i64>>,
+    xs: Vec<Vec<i64>>,
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> pyo3::PyResult<Vec<Vec<i64>>> {
+    py.detach(|| {
+        Ok(compute_delta_rows_native(
+            &a,
+            &b,
+            &xs,
+            scaling_num,
+            scaling_den,
+            scale_bits,
+            value_bits,
+            intermediate_bits,
+        )?)
+    })
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn quantize_rows(
+    py: pyo3::Python<'_>,
+    rows: Vec<Vec<String>>,
+    scale_bits: u32,
+    value_bits: u32,
+) -> pyo3::PyResult<Vec<Vec<i64>>> {
+    py.detach(|| Ok(quantize_rows_exact(&rows, scale_bits, value_bits)?))
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
 fn merkle_root(py: pyo3::Python<'_>, values: Vec<f64>, nonce: Vec<u8>) -> pyo3::PyResult<Vec<u8>> {
     py.detach(|| Ok(merkle_root_f64(&values, &nonce).to_vec()))
 }
@@ -1720,6 +1944,8 @@ fn _native_prover(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<
     m.add_function(wrap_pyfunction!(statement_digest, m)?)?;
     m.add_function(wrap_pyfunction!(adapter_commitment, m)?)?;
     m.add_function(wrap_pyfunction!(compute_delta_quantized, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_delta_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(quantize_rows, m)?)?;
     m.add_function(wrap_pyfunction!(merkle_root, m)?)?;
     Ok(())
 }

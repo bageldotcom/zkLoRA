@@ -14,9 +14,9 @@ from ..proof_contract import (
     FixedPointConfig,
     InvocationWitness,
     adapter_manifest_entry,
-    compute_delta_quantized,
-    flatten,
+    compute_delta_quantized_rows,
     quantize_nested,
+    quantize_rows,
     write_adapter_manifest,
 )
 
@@ -159,19 +159,19 @@ class LoRAServer:
         sid = session_id or "default-session"
         key = (sid, sub_name)
         x_rows = input_tensor.detach().cpu().float().reshape(-1, int(a_matrix.shape[1]))
+        q_x_rows = quantize_rows(
+            [x_row.cpu().numpy().tolist() for x_row in x_rows], self.fixed_point
+        )
+        q_delta_rows = compute_delta_quantized_rows(
+            a_quantized,
+            b_quantized,
+            q_x_rows,
+            scaling_num,
+            scaling_den,
+            self.fixed_point,
+        )
         delta_rows = []
-        for x_row in x_rows:
-            q_x = flatten(
-                quantize_nested(x_row.cpu().numpy().tolist(), self.fixed_point)
-            )
-            q_delta = compute_delta_quantized(
-                a_quantized,
-                b_quantized,
-                q_x,
-                scaling_num,
-                scaling_den,
-                self.fixed_point,
-            )
+        for q_x, q_delta in zip(q_x_rows, q_delta_rows):
             delta_rows.append([int(v) for v in q_delta])
             invocation_index = self._invocation_counts.get(key, 0)
             self._invocation_counts[key] = invocation_index + 1

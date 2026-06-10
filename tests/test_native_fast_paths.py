@@ -15,6 +15,9 @@ from zklora.proof_contract import (  # noqa: E402
     ProofContractError,
     _compute_delta_quantized_python,
     compute_delta_quantized,
+    compute_delta_quantized_rows,
+    quantize_rows,
+    quantize_scalar,
 )
 
 if os.environ.get("ZKLORA_REQUIRE_NATIVE_EXTENSION") == "1":
@@ -66,6 +69,67 @@ def test_native_delta_bound_violations_raise_contract_errors():
         compute_delta_quantized([[too_big]], [[1]], [1], 1, 1, config)
     with pytest.raises(ProofContractError, match="scaling_den must be positive"):
         compute_delta_quantized([[1]], [[1]], [1], 1, 0, config)
+
+
+def test_batched_delta_rows_match_single_row_reference():
+    rng = random.Random(5)
+    config = FixedPointConfig()
+    a, b, _ = _random_case(rng, 24, 3, 12, 1 << 21)
+    xs = [
+        [rng.randint(-(1 << 21), 1 << 21) for _ in range(24)] for _ in range(7)
+    ]
+    expected = [
+        _compute_delta_quantized_python(a, b, x, 3, 2, config) for x in xs
+    ]
+    assert compute_delta_quantized_rows(a, b, xs, 3, 2, config) == expected
+    assert compute_delta_quantized_rows(a, b, [], 3, 2, config) == []
+
+
+def test_native_quantize_rows_matches_decimal_reference():
+    rng = random.Random(31)
+    config = FixedPointConfig()
+    values = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        0.1,
+        -0.1,
+        1.5,
+        2.5,
+        -2.5,
+        # exact representable ties at the scale boundary
+        0.5 / config.scale,
+        -0.5 / config.scale,
+        1.5 / config.scale,
+        3.0 / (1 << (config.scale_bits + 1)),
+        # subnormals and tiny values round to zero
+        5e-324,
+        -5e-324,
+        1e-30,
+        # large but in-bound magnitudes
+        1e9,
+        -123456789.123456789,
+        2.0**40,
+        # values produced by float32 tensors
+        float.fromhex("0x1.91eb851eb851fp+1"),
+    ]
+    values += [rng.uniform(-1e6, 1e6) for _ in range(500)]
+    values += [rng.uniform(-1e-6, 1e-6) for _ in range(200)]
+    # Regression: Rust's float formatter picks a different shortest round-trip
+    # digit string than CPython's str() for this value; quantization must
+    # follow CPython's, which is why the native path receives decimal strings.
+    values.append(4313614032396.1562)
+    expected = [[quantize_scalar(v, config) for v in values]]
+    assert quantize_rows([values], config) == expected
+
+
+def test_native_quantize_rows_out_of_bound_falls_back_to_exact_error():
+    config = FixedPointConfig(scale_bits=2, value_bits=8, intermediate_bits=16)
+    with pytest.raises(ProofContractError, match="exceeds signed bound"):
+        quantize_rows([[1e30]], config)
+    with pytest.raises(Exception):
+        quantize_rows([[float("nan")]], config)
 
 
 def test_native_merkle_root_matches_python_reference():

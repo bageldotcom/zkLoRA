@@ -146,6 +146,33 @@ def quantize_nested(values: Any, config: FixedPointConfig) -> Any:
     return quantize_scalar(values, config)
 
 
+def quantize_rows(rows: list[list[float]], config: FixedPointConfig) -> list[list[int]]:
+    """Quantize flat float rows with exact quantize_scalar semantics.
+
+    The native implementation reproduces Decimal(str(value)) round-half-up
+    rounding using exact integer arithmetic over the shortest round-trip
+    decimal representation; the Python path is the reference fallback.
+    """
+    if not rows:
+        return []
+    native = _native_module()
+    if native is not None and hasattr(native, "quantize_rows"):
+        try:
+            # str(float) is the semantic anchor of quantize_scalar; passing the
+            # strings keeps the native path bit-identical to Decimal(str(v)).
+            return [
+                [int(v) for v in row]
+                for row in native.quantize_rows(
+                    [[str(float(v)) for v in row] for row in rows],
+                    config.scale_bits,
+                    config.value_bits,
+                )
+            ]
+        except (OverflowError, TypeError, ValueError):
+            pass
+    return [[quantize_scalar(v, config) for v in row] for row in rows]
+
+
 def flatten(values: Any) -> list[int]:
     if isinstance(values, (list, tuple)):
         out: list[int] = []
@@ -217,6 +244,45 @@ def compute_delta_quantized(
             # produces the result or raises the canonical contract error.
             pass
     return _compute_delta_quantized_python(a, b, x, scaling_num, scaling_den, config)
+
+
+def compute_delta_quantized_rows(
+    a: list[list[int]],
+    b: list[list[int]],
+    xs: list[list[int]],
+    scaling_num: int,
+    scaling_den: int,
+    config: FixedPointConfig,
+) -> list[list[int]]:
+    """Batched delta computation for multiple input rows of one adapter.
+
+    Uses the parallel native fast path when available (validating the adapter
+    once instead of per row), with the exact per-row implementation as
+    fallback. Results are identical to mapping compute_delta_quantized.
+    """
+    if not xs:
+        return []
+    native = _native_module()
+    if native is not None and hasattr(native, "compute_delta_rows"):
+        try:
+            return [
+                [int(v) for v in row]
+                for row in native.compute_delta_rows(
+                    a,
+                    b,
+                    xs,
+                    int(scaling_num),
+                    int(scaling_den),
+                    config.scale_bits,
+                    config.value_bits,
+                    config.intermediate_bits,
+                )
+            ]
+        except (OverflowError, TypeError, ValueError):
+            pass
+    return [
+        compute_delta_quantized(a, b, x, scaling_num, scaling_den, config) for x in xs
+    ]
 
 
 def _compute_delta_quantized_python(
