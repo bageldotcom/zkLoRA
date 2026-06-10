@@ -1,3 +1,4 @@
+import hashlib
 import socket
 import threading
 import os
@@ -87,15 +88,25 @@ class LoRAServer:
         """Quantize a module's LoRA matrices once and reuse them everywhere.
 
         Quantization runs element-wise through Decimal for exact round-half-up
-        semantics, which is far too slow to repeat on every invocation.
+        semantics, which is far too slow to repeat on every invocation. The
+        cache is keyed on the current weight bytes and scaling, so a module
+        whose adapter weights are swapped or updated in place is re-quantized
+        instead of being served stale matrices.
         """
-        with self._module_cache_lock:
-            cached = self._module_cache.get(sub_name)
-        if cached is not None:
-            return cached
         module = self.submodules[sub_name]
         a_matrix, b_matrix, scaling_num, scaling_den = lora_matrices_and_scaling(module)
+        fingerprint = (
+            hashlib.sha256(a_matrix.numpy().tobytes()).digest(),
+            hashlib.sha256(b_matrix.numpy().tobytes()).digest(),
+            int(scaling_num),
+            int(scaling_den),
+        )
+        with self._module_cache_lock:
+            cached = self._module_cache.get(sub_name)
+        if cached is not None and cached["fingerprint"] == fingerprint:
+            return cached
         artifacts = {
+            "fingerprint": fingerprint,
             "a_matrix": a_matrix,
             "b_matrix": b_matrix,
             "scaling_num": int(scaling_num),
@@ -108,8 +119,8 @@ class LoRAServer:
             ),
         }
         with self._module_cache_lock:
-            self._module_cache.setdefault(sub_name, artifacts)
-            return self._module_cache[sub_name]
+            self._module_cache[sub_name] = artifacts
+        return artifacts
 
     def adapter_manifest_entries(self):
         entries = []

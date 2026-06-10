@@ -1590,10 +1590,12 @@ fn delta_for_row(
 
     let overflow =
         || NativeError::InvalidDimensions("intermediate value exceeds native range".into());
-    let div_round = |numerator: i128, denominator: i128| -> i128 {
+    let div_round = |numerator: i128, denominator: i128| -> Result<i128, NativeError> {
         // denominator > 0 here; floor((n + d/2) / d), matching div_floor.
-        let n = numerator + denominator / 2;
-        n.div_euclid(denominator)
+        let n = numerator
+            .checked_add(denominator / 2)
+            .ok_or_else(overflow)?;
+        Ok(n.div_euclid(denominator))
     };
 
     let mut intermediate = Vec::with_capacity(a.len());
@@ -1611,7 +1613,7 @@ fn delta_for_row(
                 ctx.intermediate_bound
             )));
         }
-        intermediate.push(div_round(raw, ctx.scale));
+        intermediate.push(div_round(raw, ctx.scale)?);
     }
 
     let mut delta = Vec::with_capacity(b.len());
@@ -1627,11 +1629,11 @@ fn delta_for_row(
                 ctx.intermediate_bound
             )));
         }
-        let rescaled = div_round(raw, ctx.scale);
+        let rescaled = div_round(raw, ctx.scale)?;
         let scaled = rescaled
             .checked_mul(ctx.scaling_num as i128)
             .ok_or_else(overflow)?;
-        let out = div_round(scaled, ctx.scaling_den as i128);
+        let out = div_round(scaled, ctx.scaling_den as i128)?;
         if out < -ctx.value_bound || out > ctx.value_bound {
             return Err(NativeError::InvalidDimensions(format!(
                 "delta value {out} exceeds signed bound +/-{}",
@@ -2232,7 +2234,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "IPA proof generation for the Poseidon/range-check circuit is intentionally slow"]
     fn real_proof_verifies_for_tiny_relation() {
         let circuit = minimal_circuit();
         let statement = NativeStatement {
@@ -2361,6 +2362,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(delta, circuit.delta);
+    }
+
+    #[test]
+    fn native_delta_reports_div_round_overflow_as_error() {
+        // intermediate = 2^62 - 1, raw_b = 2^65 - 8, and
+        // scaled = (2^65 - 8) * (2^62 + 1) = 2^127 - 8 fits i128, but adding
+        // scaling_den / 2 = 8 in the rounding step would overflow. The fast
+        // path must surface this as an error (so the Python caller falls back
+        // to the arbitrary-precision path) rather than panic or wrap.
+        let result = compute_delta_quantized_native(
+            &[vec![1]],
+            &[vec![8]],
+            &[(1i64 << 62) - 1],
+            (1i64 << 62) + 1,
+            17,
+            0,
+            63,
+            127,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
