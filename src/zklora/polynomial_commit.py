@@ -82,6 +82,43 @@ def _merkle_root(values: List[Union[int, float]], nonce: bytes) -> bytes:
     return level[0]
 
 
+def _flatten_input_data(data) -> List[Union[int, float]]:
+    """Flatten ``data["input_data"]`` to a flat list of scalars.
+
+    Uses numpy for rectangular data and a recursive fallback for ragged data,
+    preserving depth-first leaf order in both cases.
+    """
+    try:
+        import numpy as np  # local import to avoid hard dependency
+
+        return np.asarray(data["input_data"], dtype=np.float64).reshape(-1).tolist()
+    except Exception:
+
+        def _flatten(x):
+            for y in x:
+                if isinstance(y, (list, tuple)):
+                    yield from _flatten(y)
+                else:
+                    yield y
+
+        return list(_flatten(data["input_data"]))
+
+
+def _merkle_root_from_file(activations_path: str, nonce: bytes) -> bytes:
+    """Compute the hiding Merkle root of an activations file.
+
+    JSON parsing stays in Python on purpose: it defines the exact float
+    semantics of the commitment (the nearest-f64 produced by ``json``/``float``),
+    and a native JSON parser does not always round identically. The leaf and
+    tree hashing then runs through ``_merkle_root``, which uses the native
+    BLAKE3 fast path when available and is byte-identical to the pure-Python
+    reference.
+    """
+    with open(activations_path, "r") as f:
+        data = json.load(f)
+    return _merkle_root(_flatten_input_data(data), nonce)
+
+
 # --------------------------------------------------------------------------------------
 # Public API (names preserved for backwards compatibility)
 # --------------------------------------------------------------------------------------
@@ -97,32 +134,11 @@ def commit_activations(activations_path: str) -> str:
         JSON string containing both the Merkle root and nonce:
         {"root": "0x...", "nonce": "0x..."}
     """
-    with open(activations_path, "r") as f:
-        data = json.load(f)
-
-    # Flatten arbitrarily nested lists using numpy when available for speed
-    try:
-        import numpy as np  # local import to avoid hard dependency
-
-        flat_vals = (
-            np.asarray(data["input_data"], dtype=np.float64).reshape(-1).tolist()
-        )
-    except Exception:
-        # fallback: naïve Python flatten
-        def _flatten(x):
-            for y in x:
-                if isinstance(y, (list, tuple)):
-                    yield from _flatten(y)
-                else:
-                    yield y
-
-        flat_vals = list(_flatten(data["input_data"]))
-
     # Generate random nonce for hiding property
     nonce = os.urandom(32)
 
-    # Compute Merkle root with nonce
-    root = _merkle_root(flat_vals, nonce)
+    # Compute Merkle root with nonce (native single-pass when available)
+    root = _merkle_root_from_file(activations_path, nonce)
 
     # Return JSON with both root and nonce
     commitment_data = {"root": "0x" + root.hex(), "nonce": "0x" + nonce.hex()}
@@ -159,29 +175,8 @@ def verify_commitment(activations_path: str, commitment: str) -> bool:
         # Invalid commitment format
         return False
 
-    # Load and flatten activations
-    with open(activations_path, "r") as f:
-        data = json.load(f)
-
-    try:
-        import numpy as np
-
-        flat_vals = (
-            np.asarray(data["input_data"], dtype=np.float64).reshape(-1).tolist()
-        )
-    except Exception:
-
-        def _flatten(x):
-            for y in x:
-                if isinstance(y, (list, tuple)):
-                    yield from _flatten(y)
-                else:
-                    yield y
-
-        flat_vals = list(_flatten(data["input_data"]))
-
-    # Recompute root with provided nonce
-    computed_root = _merkle_root(flat_vals, nonce)
+    # Recompute root with provided nonce (native single-pass when available)
+    computed_root = _merkle_root_from_file(activations_path, nonce)
 
     # Compare roots
     return computed_root == expected_root
