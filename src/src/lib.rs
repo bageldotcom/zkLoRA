@@ -1,5 +1,4 @@
 use ff::PrimeField;
-#[cfg(any(test, feature = "python"))]
 use halo2_gadgets::poseidon::primitives::Hash as NativePoseidonHash;
 use halo2_gadgets::poseidon::{
     primitives::{ConstantLength, P128Pow5T3},
@@ -10,7 +9,8 @@ use halo2_proofs::{
     pasta::{vesta, EqAffine, Fp},
     plonk::{
         create_proof, keygen_pk, keygen_vk, verify_proof, Advice, Circuit, Column,
-        ConstraintSystem, Error, Instance, Selector, SingleVerifier,
+        ConstraintSystem, Error, Fixed, Instance, ProvingKey, Selector, SingleVerifier,
+        TableColumn, VerifyingKey,
     },
     poly::commitment::Params,
     poly::Rotation,
@@ -20,9 +20,12 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
 use rand_core::OsRng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const ADAPTER_COMMITMENT_DOMAIN: u64 = 0x5a4b4c4f5241; // "ZKLORA"
 const ADAPTER_COMMITMENT_VERSION: u64 = 1;
@@ -30,6 +33,125 @@ const ADAPTER_COMMITMENT_VERSION: u64 = 1;
 const ARTIFACT_SCHEMA_VERSION: u64 = 2;
 const FIELD_SAFE_BITS: usize = 250;
 const POSEIDON_PAIR_ROWS: usize = 96;
+const RANGE_WINDOW_MIN: u32 = 4;
+const RANGE_WINDOW_MAX: u32 = 16;
+const ROW_MARGIN: usize = 128;
+
+/// Cache key capturing everything the circuit layout (and therefore the
+/// params/proving key/verifying key) depends on. Witness values, the adapter
+/// commitment, and the statement digest are advice/instance data and do not
+/// influence key generation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CircuitKey {
+    in_dim: usize,
+    rank: usize,
+    out_dim: usize,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+    scaling_num: i64,
+    scaling_den: i64,
+}
+
+impl CircuitKey {
+    fn from_circuit(circuit: &LoraCircuit) -> Self {
+        Self {
+            in_dim: circuit.in_dim(),
+            rank: circuit.rank(),
+            out_dim: circuit.out_dim(),
+            scale_bits: circuit.fixed_point.scale_bits,
+            value_bits: circuit.fixed_point.value_bits,
+            intermediate_bits: circuit.fixed_point.intermediate_bits,
+            scaling_num: circuit.scaling_num,
+            scaling_den: circuit.scaling_den,
+        }
+    }
+}
+
+/// Simple bounded FIFO cache. Proving keys and SRS params at large `k` are
+/// hundreds of MB, so we cap how many distinct shapes stay resident.
+struct BoundedCache<K, V> {
+    map: HashMap<K, Arc<V>>,
+    order: VecDeque<K>,
+    cap: usize,
+}
+
+impl<K: Clone + std::hash::Hash + Eq, V> BoundedCache<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get_or_create<E>(
+        &mut self,
+        key: &K,
+        create: impl FnOnce() -> Result<V, E>,
+    ) -> Result<Arc<V>, E> {
+        if let Some(value) = self.map.get(key) {
+            return Ok(value.clone());
+        }
+        let value = Arc::new(create()?);
+        while self.order.len() >= self.cap {
+            if let Some(evicted) = self.order.pop_front() {
+                self.map.remove(&evicted);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key.clone(), value.clone());
+        Ok(value)
+    }
+}
+
+fn cache_cap(env_var: &str, default: usize) -> usize {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
+fn params_for(k: u32) -> Arc<Params<EqAffine>> {
+    static CACHE: OnceLock<Mutex<BoundedCache<u32, Params<EqAffine>>>> = OnceLock::new();
+    let cache = CACHE
+        .get_or_init(|| Mutex::new(BoundedCache::new(cache_cap("ZKLORA_PARAMS_CACHE_CAP", 4))));
+    let mut guard = cache.lock().expect("params cache poisoned");
+    guard
+        .get_or_create::<std::convert::Infallible>(&k, || Ok(Params::new(k)))
+        .expect("params creation is infallible")
+}
+
+fn proving_key_for(
+    key: &CircuitKey,
+    params: &Params<EqAffine>,
+    empty_circuit: &LoraCircuit,
+) -> Result<Arc<ProvingKey<EqAffine>>, NativeError> {
+    static CACHE: OnceLock<Mutex<BoundedCache<CircuitKey, ProvingKey<EqAffine>>>> = OnceLock::new();
+    let cache =
+        CACHE.get_or_init(|| Mutex::new(BoundedCache::new(cache_cap("ZKLORA_PK_CACHE_CAP", 2))));
+    let mut guard = cache.lock().expect("pk cache poisoned");
+    guard.get_or_create(key, || {
+        let vk = keygen_vk(params, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+        keygen_pk(params, vk, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))
+    })
+}
+
+fn verifying_key_for(
+    key: &CircuitKey,
+    params: &Params<EqAffine>,
+    empty_circuit: &LoraCircuit,
+) -> Result<Arc<VerifyingKey<EqAffine>>, NativeError> {
+    static CACHE: OnceLock<Mutex<BoundedCache<CircuitKey, VerifyingKey<EqAffine>>>> =
+        OnceLock::new();
+    let cache =
+        CACHE.get_or_init(|| Mutex::new(BoundedCache::new(cache_cap("ZKLORA_VK_CACHE_CAP", 8))));
+    let mut guard = cache.lock().expect("vk cache poisoned");
+    guard.get_or_create(key, || {
+        keygen_vk(params, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeError {
@@ -78,7 +200,6 @@ pub struct NativeWitness {
     pub b: Vec<Vec<i64>>,
 }
 
-#[cfg(any(test, feature = "python"))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AdapterCommitmentInput {
     pub schema_version: u64,
@@ -112,7 +233,15 @@ struct LoraConfig {
     mul: Selector,
     add: Selector,
     div_round: Selector,
-    boolean: Selector,
+    /// Complex selector activating one step of the range-check running sum.
+    q_range: Selector,
+    /// Per-row decomposition radix (2^window on active rows).
+    rc_factor: Column<Fixed>,
+    /// Per-row limb scale: 1 on full limbs, 2^(window - top_bits) on the top
+    /// limb so the most-significant limb is constrained to exactly its width.
+    rc_scale: Column<Fixed>,
+    /// Lookup table holding 0..2^window.
+    rc_table: TableColumn,
     poseidon_config: Pow5Config<Fp, 3, 2>,
 }
 
@@ -175,11 +304,26 @@ impl Circuit<Fp> for LoraCircuit {
             vec![s * (raw - quotient * denominator - remainder)]
         });
 
-        let boolean = meta.selector();
-        meta.create_gate("boolean bit", |meta| {
-            let s = meta.query_selector(boolean);
-            let bit = meta.query_advice(advice[0], Rotation::cur());
-            vec![s * bit.clone() * (bit - halo2_proofs::plonk::Expression::Constant(Fp::from(1)))]
+        // Lookup-based range decomposition: a running sum z walks down the
+        // value, peeling one limb per active row. On row i the constraint
+        //   q * scale_i * (z_i - z_{i+1} * factor_i)  ∈  rc_table
+        // forces limb_i = z_i - z_{i+1} * 2^window into [0, 2^window), and the
+        // top limb is multiplied by 2^(window - top_bits) so it is bounded to
+        // exactly its residual width. With z_n constrained to zero the chain
+        // telescopes to z_0 = Σ limb_i · 2^(window·i) < 2^bits with no padding
+        // slack, preserving the exact interval semantics of the previous
+        // bit-decomposition while using ~window× fewer rows.
+        let q_range = meta.complex_selector();
+        let rc_factor = meta.fixed_column();
+        let rc_scale = meta.fixed_column();
+        let rc_table = meta.lookup_table_column();
+        meta.lookup(|meta| {
+            let q = meta.query_selector(q_range);
+            let z_cur = meta.query_advice(advice[3], Rotation::cur());
+            let z_next = meta.query_advice(advice[3], Rotation::next());
+            let factor = meta.query_fixed(rc_factor);
+            let scale = meta.query_fixed(rc_scale);
+            vec![(q * scale * (z_cur - z_next * factor), rc_table)]
         });
 
         let poseidon_state = (0..3).map(|_| meta.advice_column()).collect::<Vec<_>>();
@@ -204,7 +348,10 @@ impl Circuit<Fp> for LoraCircuit {
             mul,
             add,
             div_round,
-            boolean,
+            q_range,
+            rc_factor,
+            rc_scale,
+            rc_table,
             poseidon_config,
         }
     }
@@ -215,6 +362,22 @@ impl Circuit<Fp> for LoraCircuit {
         mut layouter: impl Layouter<Fp>,
     ) -> Result<(), Error> {
         self.validate().map_err(|_| Error::Synthesis)?;
+        let window = self.window_and_k().0;
+
+        layouter.assign_table(
+            || "range check table",
+            |mut table| {
+                for value in 0..(1u64 << window) {
+                    table.assign_cell(
+                        || "range table value",
+                        config.rc_table,
+                        value as usize,
+                        || Value::known(Fp::from(value)),
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
 
         let (x_cells, delta_cells, binding_cells, adapter_words) = layouter.assign_region(
             || "zklora lora delta relation",
@@ -226,8 +389,6 @@ impl Circuit<Fp> for LoraCircuit {
                 let raw_a_bound = &value_bound * &value_bound * BigInt::from(self.in_dim());
                 let raw_b_bound = &value_bound * &intermediate_bound * BigInt::from(self.rank());
                 let scaled_raw_bound = &intermediate_bound * BigInt::from(self.scaling_num).abs();
-                let product_value_bound = &value_bound * &value_bound;
-                let product_intermediate_bound = &value_bound * &intermediate_bound;
 
                 let zero = assign_constant_cell(
                     &mut region,
@@ -329,6 +490,7 @@ impl Circuit<Fp> for LoraCircuit {
                     offset = range_check_signed_interval(
                         &mut region,
                         &config,
+                        window,
                         &cell,
                         &value_big,
                         &(-&value_bound),
@@ -355,6 +517,7 @@ impl Circuit<Fp> for LoraCircuit {
                         offset = range_check_signed_interval(
                             &mut region,
                             &config,
+                            window,
                             &weight,
                             &weight_big,
                             &(-&value_bound),
@@ -363,6 +526,11 @@ impl Circuit<Fp> for LoraCircuit {
                         )?;
                         adapter_words.push(weight.clone());
 
+                        // The product of two individually range-checked values
+                        // cannot wrap the field (|w·x| <= value_bound^2 and the
+                        // accumulated sum stays below the field-safe bound per
+                        // validate_field_safety), so the accumulator is bounded
+                        // once inside assign_div_round instead of per product.
                         let product = assign_mul(
                             &mut region,
                             &config,
@@ -372,33 +540,16 @@ impl Circuit<Fp> for LoraCircuit {
                         )?;
                         offset += 1;
                         let product_value = &weight_big * BigInt::from(self.x[input_index]);
-                        offset = range_check_signed_interval(
-                            &mut region,
-                            &config,
-                            &product,
-                            &product_value,
-                            &(-&product_value_bound),
-                            &product_value_bound,
-                            offset,
-                        )?;
                         let next_acc = assign_add(&mut region, &config, &acc, &product, offset)?;
                         offset += 1;
                         raw_value += product_value;
                         acc = next_acc;
                     }
-                    offset = range_check_signed_interval(
-                        &mut region,
-                        &config,
-                        &acc,
-                        &raw_value,
-                        &(-&raw_a_bound),
-                        &raw_a_bound,
-                        offset,
-                    )?;
                     let q = div_round_to_canonical_interval(&raw_value, &scale)?;
                     let (intermediate_cell, next_offset) = assign_div_round(
                         &mut region,
                         &config,
+                        window,
                         &acc,
                         &raw_value,
                         &q,
@@ -429,6 +580,7 @@ impl Circuit<Fp> for LoraCircuit {
                         offset = range_check_signed_interval(
                             &mut region,
                             &config,
+                            window,
                             &weight,
                             &weight_big,
                             &(-&value_bound),
@@ -446,33 +598,16 @@ impl Circuit<Fp> for LoraCircuit {
                         )?;
                         offset += 1;
                         let product_value = &weight_big * &intermediate[rank_index].1;
-                        offset = range_check_signed_interval(
-                            &mut region,
-                            &config,
-                            &product,
-                            &product_value,
-                            &(-&product_intermediate_bound),
-                            &product_intermediate_bound,
-                            offset,
-                        )?;
                         let next_acc = assign_add(&mut region, &config, &acc, &product, offset)?;
                         offset += 1;
                         raw_value += product_value;
                         acc = next_acc;
                     }
-                    offset = range_check_signed_interval(
-                        &mut region,
-                        &config,
-                        &acc,
-                        &raw_value,
-                        &(-&raw_b_bound),
-                        &raw_b_bound,
-                        offset,
-                    )?;
                     let rescaled = div_round_to_canonical_interval(&raw_value, &scale)?;
                     let (rescaled_cell, next_offset) = assign_div_round(
                         &mut region,
                         &config,
+                        window,
                         &acc,
                         &raw_value,
                         &rescaled,
@@ -493,15 +628,6 @@ impl Circuit<Fp> for LoraCircuit {
                         offset,
                     )?;
                     offset += 1;
-                    offset = range_check_signed_interval(
-                        &mut region,
-                        &config,
-                        &scaled_raw_cell,
-                        &scaled_raw,
-                        &(-&scaled_raw_bound),
-                        &scaled_raw_bound,
-                        offset,
-                    )?;
 
                     let scaling_den_big = BigInt::from(self.scaling_den);
                     let final_delta =
@@ -509,6 +635,7 @@ impl Circuit<Fp> for LoraCircuit {
                     let (final_cell, next_offset) = assign_div_round(
                         &mut region,
                         &config,
+                        window,
                         &scaled_raw_cell,
                         &scaled_raw,
                         &final_delta,
@@ -568,6 +695,10 @@ impl Circuit<Fp> for LoraCircuit {
 impl LoraCircuit {
     fn in_dim(&self) -> usize {
         self.x.len()
+    }
+
+    fn window_and_k(&self) -> (u32, u32) {
+        window_and_k_for(self)
     }
 
     fn rank(&self) -> usize {
@@ -743,6 +874,7 @@ fn assign_statement_digest_cells(
 fn assign_div_round(
     region: &mut halo2_proofs::circuit::Region<'_, Fp>,
     config: &LoraConfig,
+    window: u32,
     raw: &AssignedCell<Fp, Fp>,
     raw_value: &BigInt,
     quotient: &BigInt,
@@ -758,6 +890,7 @@ fn assign_div_round(
     offset = range_check_signed_interval(
         region,
         config,
+        window,
         raw,
         raw_value,
         &(-raw_bound),
@@ -784,6 +917,7 @@ fn assign_div_round(
     offset = range_check_signed_interval(
         region,
         config,
+        window,
         &quotient_cell,
         quotient,
         &(-quotient_bound),
@@ -794,6 +928,7 @@ fn assign_div_round(
     offset = range_check_signed_interval(
         region,
         config,
+        window,
         &remainder_cell,
         &remainder,
         &lower,
@@ -806,6 +941,7 @@ fn assign_div_round(
 fn range_check_signed_interval(
     region: &mut halo2_proofs::circuit::Region<'_, Fp>,
     config: &LoraConfig,
+    window: u32,
     value_cell: &AssignedCell<Fp, Fp>,
     value: &BigInt,
     lower: &BigInt,
@@ -839,6 +975,7 @@ fn range_check_signed_interval(
     offset = range_check_unsigned(
         region,
         config,
+        window,
         &shifted_cell,
         &shifted_unsigned,
         bits,
@@ -863,50 +1000,85 @@ fn range_check_signed_interval(
     let sum = assign_add(region, config, &shifted_cell, &diff_cell, offset)?;
     offset += 1;
     region.constrain_equal(sum.cell(), max_cell.cell())?;
-    range_check_unsigned(region, config, &diff_cell, &diff, bits, offset)
+    range_check_unsigned(region, config, window, &diff_cell, &diff, bits, offset)
 }
 
+/// Constrain `value_cell` to a small non-negative integer using a
+/// lookup-backed running sum.
+///
+/// Row `offset + i` holds `z_i` in `advice[3]`; the lookup argument enforces
+/// `scale_i * (z_i - z_{i+1} * 2^window) ∈ [0, 2^window)` per active row, with
+/// `scale_i = 2^(window - top_bits)` on the final limb and `z_n` constrained
+/// to zero.
+///
+/// Soundness: telescoping the chain over the field gives
+/// `z_0 = Σ_{i<n-1} limb_i·2^{window·i} + limb_{n-1}·2^{window·(n-2)+top_bits}`
+/// with every `limb_i ∈ [0, 2^window)` from the table. The top-limb term is
+/// bounded by `2^bits` and the lower limbs by `2^{window·(n-1)}`, so
+/// `z_0 < 2^{bits+1}` as an integer — there is at most a factor-2 slack here,
+/// NOT an exact `2^bits` cut-off (a prover can choose a top limb that is not
+/// a multiple of `2^{window-top_bits}`, making `z_{n-1}` itself a large field
+/// element while `2^{window·(n-1)}·z_{n-1}` stays small). Callers must not
+/// rely on tightness: `range_check_signed_interval` derives its EXACT bound
+/// from checking both `shifted` and `diff = max - shifted` with this routine
+/// and constraining `shifted + diff = max`; since both are non-negative
+/// integers below `2^{bits+1}` and `2^{bits+2} < p`, the sum cannot wrap and
+/// `shifted ∈ [0, max]` holds exactly.
 fn range_check_unsigned(
     region: &mut halo2_proofs::circuit::Region<'_, Fp>,
     config: &LoraConfig,
+    window: u32,
     value_cell: &AssignedCell<Fp, Fp>,
     value: &BigUint,
     bits: usize,
     mut offset: usize,
 ) -> Result<usize, Error> {
-    if bits == 0 || bits > FIELD_SAFE_BITS {
+    if bits == 0 || bits > FIELD_SAFE_BITS || window == 0 {
         return Err(Error::Synthesis);
     }
-    let mut acc = assign_constant_cell(
-        region,
-        config.advice[0],
-        offset,
-        Fp::from(0),
-        "range accumulator zero",
-    )?;
-    offset += 1;
-    for bit_index in (0..bits).rev() {
-        let bit_value = if ((value >> bit_index) & BigUint::one()).is_zero() {
-            0
-        } else {
-            1
-        };
-        config.boolean.enable(region, offset)?;
-        let bit = region.assign_advice(
-            || "range bit",
-            config.advice[0],
+    let limb_count = bits.div_ceil(window as usize);
+    let top_bits = bits - (limb_count - 1) * window as usize;
+    let factor = Fp::from(1u64 << window);
+    let mut z_value = value.clone();
+
+    for limb_index in 0..limb_count {
+        config.q_range.enable(region, offset)?;
+        region.assign_fixed(
+            || "range factor",
+            config.rc_factor,
             offset,
-            || Value::known(Fp::from(bit_value)),
+            || Value::known(factor),
         )?;
-        offset += 1;
-        let two = assign_constant_cell(region, config.advice[1], offset, Fp::from(2), "two")?;
-        offset += 1;
-        let doubled = assign_mul(region, config, &acc, &two, offset)?;
-        offset += 1;
-        acc = assign_add(region, config, &doubled, &bit, offset)?;
+        let scale = if limb_index + 1 == limb_count {
+            Fp::from(1u64 << (window as usize - top_bits))
+        } else {
+            Fp::from(1)
+        };
+        region.assign_fixed(
+            || "range scale",
+            config.rc_scale,
+            offset,
+            || Value::known(scale),
+        )?;
+        let z_cell = region.assign_advice(
+            || "range z",
+            config.advice[3],
+            offset,
+            || Value::known(fp_from_biguint_checked(&z_value).expect("z fits")),
+        )?;
+        if limb_index == 0 {
+            region.constrain_equal(z_cell.cell(), value_cell.cell())?;
+        }
+        z_value >>= window;
         offset += 1;
     }
-    region.constrain_equal(acc.cell(), value_cell.cell())?;
+    region.assign_advice_from_constant(
+        || "range z terminal",
+        config.advice[3],
+        offset,
+        Fp::from(0),
+    )?;
+    offset += 1;
     Ok(offset)
 }
 
@@ -1102,7 +1274,6 @@ fn ceil_log2(value: usize) -> usize {
     }
 }
 
-#[cfg(any(test, feature = "python"))]
 fn adapter_commitment_words_from_input(
     input: &AdapterCommitmentInput,
 ) -> Result<Vec<Fp>, NativeError> {
@@ -1128,7 +1299,6 @@ fn adapter_commitment_words_from_input(
     Ok(words)
 }
 
-#[cfg(any(test, feature = "python"))]
 fn adapter_commitment_for_input(input: &AdapterCommitmentInput) -> Result<String, NativeError> {
     let mut acc = Fp::from(0);
     for word in adapter_commitment_words_from_input(input)? {
@@ -1157,44 +1327,74 @@ fn public_inputs(circuit: &LoraCircuit) -> Result<Vec<Fp>, NativeError> {
     Ok(inputs)
 }
 
-fn rows_needed(circuit: &LoraCircuit) -> usize {
+/// Rows used by one signed-interval range check at the given window:
+/// shift constant + add + two running-sum chains (limbs + terminal zero each)
+/// + max constant + diff + sum row.
+fn signed_check_rows(bits: usize, window: u32) -> usize {
+    let limbs = bits.max(1).div_ceil(window as usize);
+    2 * (limbs + 1) + 5
+}
+
+fn rows_needed(circuit: &LoraCircuit, window: u32) -> usize {
     let value_bits = circuit.fixed_point.value_bits as usize;
     let intermediate_bits = circuit.fixed_point.intermediate_bits as usize;
+    let scale_bits = circuit.fixed_point.scale_bits as usize;
     let raw_a_bits = value_bits
         .saturating_mul(2)
-        .saturating_add(ceil_log2(circuit.in_dim().max(1)));
+        .saturating_add(ceil_log2(circuit.in_dim().max(1)))
+        .saturating_add(1);
     let raw_b_bits = value_bits
         .saturating_add(intermediate_bits)
-        .saturating_add(ceil_log2(circuit.rank().max(1)));
+        .saturating_add(ceil_log2(circuit.rank().max(1)))
+        .saturating_add(1);
     let scaling_bits = bit_length_i64(circuit.scaling_num).max(1);
-    let scaled_bits = intermediate_bits.saturating_add(scaling_bits);
-    let product_bits = value_bits
-        .saturating_mul(2)
-        .max(value_bits.saturating_add(intermediate_bits))
-        .max(scaled_bits);
-    let accumulator_bits = raw_a_bits.max(raw_b_bits);
-    let range_rows = |bits: usize| 8 * bits.max(1) + 16;
+    let scaled_bits = intermediate_bits.saturating_add(scaling_bits).max(1);
+    let den_bits = bit_length_i64(circuit.scaling_den).max(1);
+    let rc = |bits: usize| signed_check_rows(bits, window);
     let matrix_values = circuit.rank() * circuit.in_dim() + circuit.out_dim() * circuit.rank();
-    let products = matrix_values + circuit.out_dim();
-    let divs = circuit.rank() + 2 * circuit.out_dim();
     let adapter_words = 11 + matrix_values;
-    32 + circuit.in_dim()
-        + 4 * matrix_values
-        + 4 * products
-        + 4 * circuit.out_dim()
-        + circuit.in_dim() * range_rows(value_bits)
-        + matrix_values * range_rows(value_bits)
-        + products * range_rows(product_bits)
-        + (circuit.rank() + circuit.out_dim()) * range_rows(accumulator_bits)
-        + divs
-            * (range_rows(raw_a_bits.max(raw_b_bits).max(scaled_bits))
-                + range_rows(intermediate_bits))
+    // div block: raw range check + division row + quotient check + remainder check
+    let div_a = rc(raw_a_bits) + 1 + rc(intermediate_bits) + rc(scale_bits.max(1));
+    let div_b = rc(raw_b_bits) + 1 + rc(intermediate_bits) + rc(scale_bits.max(1));
+    let div_final = rc(scaled_bits) + 1 + rc(value_bits) + rc(den_bits);
+    32 + circuit.in_dim() * (1 + rc(value_bits))
+        + matrix_values * (3 + rc(value_bits))
+        + circuit.rank() * div_a
+        + circuit.out_dim() * (div_b + 1 + div_final)
         + adapter_words * POSEIDON_PAIR_ROWS
+        + ROW_MARGIN
+}
+
+/// Deterministically choose the lookup window and circuit size from the
+/// statement shape alone, so prover and verifier always derive the same
+/// circuit. Smaller windows shrink the lookup table for tiny circuits while
+/// larger windows minimise rows for big ones; we pick the (k, window) pair
+/// with the smallest k, preferring larger windows on ties.
+fn window_and_k_for(circuit: &LoraCircuit) -> (u32, u32) {
+    let mut best: Option<(u32, u32)> = None;
+    for window in RANGE_WINDOW_MIN..=RANGE_WINDOW_MAX {
+        let rows = rows_needed(circuit, window);
+        let table_rows = (1usize << window) + ROW_MARGIN;
+        let needed = rows.max(table_rows).next_power_of_two();
+        let k = needed.trailing_zeros().max(8);
+        let candidate = (k, window);
+        best = Some(match best {
+            None => candidate,
+            Some((best_k, best_w)) => {
+                if k < best_k || (k == best_k && window > best_w) {
+                    candidate
+                } else {
+                    (best_k, best_w)
+                }
+            }
+        });
+    }
+    let (k, window) = best.expect("window range is non-empty");
+    (window, k)
 }
 
 fn k_for(circuit: &LoraCircuit) -> u32 {
-    let rows = rows_needed(circuit).next_power_of_two();
-    rows.trailing_zeros().max(8)
+    circuit.window_and_k().1
 }
 
 fn circuit_from_json(statement_json: &str, witness_json: &str) -> Result<LoraCircuit, NativeError> {
@@ -1237,9 +1437,9 @@ fn default_scaling_den() -> i64 {
 pub fn prove_bytes(statement_json: &str, witness_json: &str) -> Result<Vec<u8>, NativeError> {
     let circuit = circuit_from_json(statement_json, witness_json)?;
     let k = k_for(&circuit);
-    let params: Params<EqAffine> = Params::new(k);
-    let vk = keygen_vk(&params, &circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
-    let pk = keygen_pk(&params, vk, &circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    let params = params_for(k);
+    let key = CircuitKey::from_circuit(&circuit);
+    let pk = proving_key_for(&key, &params, &circuit.without_witnesses())?;
     let instances = public_inputs(&circuit)?;
     let instance_refs: Vec<&[Fp]> = vec![instances.as_slice()];
     let mut transcript = Blake2bWrite::<_, vesta::Affine, Challenge255<_>>::init(vec![]);
@@ -1267,8 +1467,9 @@ pub fn verify_bytes(statement_json: &str, proof: &[u8]) -> Result<bool, NativeEr
         &serde_json::to_string(&witness_shape).map_err(|e| NativeError::Json(e.to_string()))?,
     )?;
     let k = k_for(&circuit);
-    let params: Params<EqAffine> = Params::new(k);
-    let vk = keygen_vk(&params, &circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    let params = params_for(k);
+    let key = CircuitKey::from_circuit(&circuit);
+    let vk = verifying_key_for(&key, &params, &circuit)?;
     let instances = public_inputs(&circuit)?;
     let instance_refs: Vec<&[Fp]> = vec![instances.as_slice()];
     let mut transcript = Blake2bRead::<_, vesta::Affine, Challenge255<_>>::init(proof);
@@ -1288,16 +1489,375 @@ pub fn statement_digest_hex(statement_json: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-#[cfg(feature = "python")]
-#[pyo3::pyfunction]
-fn prove(statement_json: &str, witness_json: &str) -> pyo3::PyResult<Vec<u8>> {
-    Ok(prove_bytes(statement_json, witness_json)?)
+/// Shared validation/bounds context for the exact integer delta fast path.
+struct DeltaContext {
+    in_dim: usize,
+    value_bound: i128,
+    intermediate_bound: i128,
+    scale: i128,
+    scaling_num: i64,
+    scaling_den: i64,
+}
+
+fn delta_context(
+    a: &[Vec<i64>],
+    b: &[Vec<i64>],
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> Result<DeltaContext, NativeError> {
+    if scaling_den <= 0 {
+        return Err(NativeError::InvalidDimensions(
+            "scaling_den must be positive".into(),
+        ));
+    }
+    if value_bits == 0 || value_bits > 63 || intermediate_bits == 0 || intermediate_bits > 127 {
+        return Err(NativeError::InvalidDimensions(
+            "bit widths outside native fast-path range".into(),
+        ));
+    }
+    if scale_bits >= value_bits {
+        return Err(NativeError::InvalidDimensions(
+            "scale_bits must be less than value_bits".into(),
+        ));
+    }
+    let rank = a.len();
+    if rank == 0 {
+        return Err(NativeError::InvalidDimensions(
+            "rank must be positive".into(),
+        ));
+    }
+    let in_dim = a[0].len();
+    for row in a {
+        if row.len() != in_dim {
+            return Err(NativeError::InvalidDimensions(
+                "A row width must match x length".into(),
+            ));
+        }
+    }
+    for row in b {
+        if row.len() != rank {
+            return Err(NativeError::InvalidDimensions(
+                "B row width must match A rank".into(),
+            ));
+        }
+    }
+    let value_bound = (1i128 << (value_bits - 1)) - 1;
+    for value in a.iter().flatten() {
+        check_native_bound(*value, value_bound, "A")?;
+    }
+    for value in b.iter().flatten() {
+        check_native_bound(*value, value_bound, "B")?;
+    }
+    Ok(DeltaContext {
+        in_dim,
+        value_bound,
+        intermediate_bound: (1i128 << (intermediate_bits - 1)) - 1,
+        scale: 1i128 << scale_bits,
+        scaling_num,
+        scaling_den,
+    })
+}
+
+fn check_native_bound(value: i64, bound: i128, label: &str) -> Result<(), NativeError> {
+    let value = value as i128;
+    if value < -bound || value > bound {
+        return Err(NativeError::InvalidDimensions(format!(
+            "{label} value {value} exceeds signed bound +/-{bound}"
+        )));
+    }
+    Ok(())
+}
+
+fn delta_for_row(
+    ctx: &DeltaContext,
+    a: &[Vec<i64>],
+    b: &[Vec<i64>],
+    x: &[i64],
+) -> Result<Vec<i64>, NativeError> {
+    if x.len() != ctx.in_dim {
+        return Err(NativeError::InvalidDimensions(format!(
+            "x expected length {}, got {}",
+            ctx.in_dim,
+            x.len()
+        )));
+    }
+    for value in x {
+        check_native_bound(*value, ctx.value_bound, "x")?;
+    }
+
+    let overflow =
+        || NativeError::InvalidDimensions("intermediate value exceeds native range".into());
+    let div_round = |numerator: i128, denominator: i128| -> Result<i128, NativeError> {
+        // denominator > 0 here; floor((n + d/2) / d), matching div_floor.
+        let n = numerator
+            .checked_add(denominator / 2)
+            .ok_or_else(overflow)?;
+        Ok(n.div_euclid(denominator))
+    };
+
+    let mut intermediate = Vec::with_capacity(a.len());
+    for row in a {
+        let mut raw: i128 = 0;
+        for (weight, x_i) in row.iter().zip(x.iter()) {
+            let product = (*weight as i128)
+                .checked_mul(*x_i as i128)
+                .ok_or_else(overflow)?;
+            raw = raw.checked_add(product).ok_or_else(overflow)?;
+        }
+        if raw < -ctx.intermediate_bound || raw > ctx.intermediate_bound {
+            return Err(NativeError::InvalidDimensions(format!(
+                "intermediate value {raw} exceeds signed bound +/-{}",
+                ctx.intermediate_bound
+            )));
+        }
+        intermediate.push(div_round(raw, ctx.scale)?);
+    }
+
+    let mut delta = Vec::with_capacity(b.len());
+    for row in b {
+        let mut raw: i128 = 0;
+        for (weight, value) in row.iter().zip(intermediate.iter()) {
+            let product = (*weight as i128).checked_mul(*value).ok_or_else(overflow)?;
+            raw = raw.checked_add(product).ok_or_else(overflow)?;
+        }
+        if raw < -ctx.intermediate_bound || raw > ctx.intermediate_bound {
+            return Err(NativeError::InvalidDimensions(format!(
+                "intermediate value {raw} exceeds signed bound +/-{}",
+                ctx.intermediate_bound
+            )));
+        }
+        let rescaled = div_round(raw, ctx.scale)?;
+        let scaled = rescaled
+            .checked_mul(ctx.scaling_num as i128)
+            .ok_or_else(overflow)?;
+        let out = div_round(scaled, ctx.scaling_den as i128)?;
+        if out < -ctx.value_bound || out > ctx.value_bound {
+            return Err(NativeError::InvalidDimensions(format!(
+                "delta value {out} exceeds signed bound +/-{}",
+                ctx.value_bound
+            )));
+        }
+        delta.push(out as i64);
+    }
+    Ok(delta)
+}
+
+/// Exact integer LoRA delta computation mirroring
+/// `proof_contract.compute_delta_quantized`. All arithmetic uses checked i128
+/// operations; any overflow or bound violation is reported as an error so the
+/// Python caller can fall back to its arbitrary-precision implementation. The
+/// rounding rule is the same canonical half-up floor division used in-circuit.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_delta_quantized_native(
+    a: &[Vec<i64>],
+    b: &[Vec<i64>],
+    x: &[i64],
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> Result<Vec<i64>, NativeError> {
+    let ctx = delta_context(
+        a,
+        b,
+        scaling_num,
+        scaling_den,
+        scale_bits,
+        value_bits,
+        intermediate_bits,
+    )?;
+    delta_for_row(&ctx, a, b, x)
+}
+
+/// Batched variant: validates the adapter once and computes every row's delta
+/// in parallel. Semantics per row are identical to the single-row function.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_delta_rows_native(
+    a: &[Vec<i64>],
+    b: &[Vec<i64>],
+    xs: &[Vec<i64>],
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> Result<Vec<Vec<i64>>, NativeError> {
+    let ctx = delta_context(
+        a,
+        b,
+        scaling_num,
+        scaling_den,
+        scale_bits,
+        value_bits,
+        intermediate_bits,
+    )?;
+    xs.par_iter()
+        .map(|x| delta_for_row(&ctx, a, b, x))
+        .collect()
+}
+
+/// Exact fixed-point quantization of one decimal string, replicating
+/// `proof_contract.quantize_scalar`: the caller passes Python's `str(float)`
+/// output (the semantics anchor for quantization), and this routine computes
+/// `round_half_up_away_from_zero(decimal_value * 2^scale_bits)` in exact
+/// integer arithmetic. Rust's own float formatter is deliberately NOT used:
+/// it can pick a different shortest round-trip digit string than CPython's
+/// repr for the same f64, which would silently change quantized values.
+pub fn quantize_decimal_str_exact(
+    text: &str,
+    scale_bits: u32,
+    value_bits: u32,
+) -> Result<i64, NativeError> {
+    if value_bits == 0 || value_bits > 63 || scale_bits >= value_bits {
+        return Err(NativeError::InvalidDimensions(
+            "fixed-point bits outside native fast-path range".into(),
+        ));
+    }
+    let value_bound = (1i128 << (value_bits - 1)) - 1;
+
+    let bad = || NativeError::InvalidDimensions(format!("cannot quantize value {text:?}"));
+    let trimmed = text.trim();
+    let (negative, unsigned) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let (mantissa_text, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exp)) => (mantissa, exp.parse::<i32>().map_err(|_| bad())?),
+        None => (unsigned, 0),
+    };
+    let (int_text, frac_text) = match mantissa_text.split_once('.') {
+        Some((int_part, frac_part)) => (int_part, frac_part),
+        None => (mantissa_text, ""),
+    };
+    if int_text.is_empty() && frac_text.is_empty() {
+        return Err(bad());
+    }
+    let digits: String = format!("{int_text}{frac_text}");
+    if digits.is_empty() || digits.len() > 30 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        // Non-finite values ('inf'/'nan'), or more digits than the i128 fast
+        // path can hold: defer to the Python reference implementation.
+        return Err(bad());
+    }
+    let mantissa: i128 = digits.parse().map_err(|_| bad())?;
+    let pow10 = exponent
+        .checked_sub(frac_text.len() as i32)
+        .ok_or_else(bad)?;
+
+    let bound_err = || {
+        NativeError::InvalidDimensions(format!(
+            "quantized value of {text:?} exceeds signed bound +/-{value_bound}"
+        ))
+    };
+    let magnitude = if mantissa == 0 {
+        0i128
+    } else if pow10 >= 0 {
+        // Integral decimal value: scale exactly, no rounding needed.
+        let mut scaled = mantissa;
+        for _ in 0..pow10 {
+            scaled = scaled.checked_mul(10).ok_or_else(bound_err)?;
+        }
+        scaled
+            .checked_mul(1i128 << scale_bits)
+            .ok_or_else(bound_err)?
+    } else {
+        let k = -pow10 as u32;
+        // numerator = mantissa * 2^scale_bits, denominator = 10^k. With at
+        // most 30 mantissa digits the numerator can overflow i128 only via
+        // checked_mul (reported as out-of-fast-path); for k beyond i128's
+        // 10^38 capacity the quotient is zero when numerator < 10^k / 2.
+        let numerator = mantissa
+            .checked_mul(1i128 << scale_bits)
+            .ok_or_else(bound_err)?;
+        if k > 38 {
+            // 10^39 / 2 = 5e38 exceeds i128::MAX (~1.7e38), so any in-range
+            // numerator is strictly below half the denominator: rounds to 0.
+            0
+        } else {
+            let denominator = 10i128.pow(k);
+            (numerator + denominator / 2) / denominator
+        }
+    };
+    let signed = if negative { -magnitude } else { magnitude };
+    if signed < -value_bound || signed > value_bound {
+        return Err(NativeError::InvalidDimensions(format!(
+            "quantized value {signed} exceeds signed bound +/-{value_bound}"
+        )));
+    }
+    Ok(signed as i64)
+}
+
+/// Quantize whole rows in parallel with exact scalar semantics.
+pub fn quantize_rows_exact(
+    rows: &[Vec<String>],
+    scale_bits: u32,
+    value_bits: u32,
+) -> Result<Vec<Vec<i64>>, NativeError> {
+    rows.par_iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| quantize_decimal_str_exact(value, scale_bits, value_bits))
+                .collect()
+        })
+        .collect()
+}
+
+const MERKLE_EMPTY: [u8; 32] = [0u8; 32];
+
+/// Hiding Merkle root over f64 leaves, byte-identical to
+/// `zklora.polynomial_commit._merkle_root` (BLAKE3 leaves salted with the
+/// nonce, right-padded with the EMPTY leaf so internal levels stay even).
+pub fn merkle_root_f64(values: &[f64], nonce: &[u8]) -> [u8; 32] {
+    if values.is_empty() {
+        return MERKLE_EMPTY;
+    }
+    let mut level: Vec<[u8; 32]> = values
+        .par_iter()
+        .map(|value| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&value.to_be_bytes());
+            hasher.update(nonce);
+            *hasher.finalize().as_bytes()
+        })
+        .collect();
+    if level.len() % 2 == 1 {
+        level.push(MERKLE_EMPTY);
+    }
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = level
+            .par_chunks_exact(2)
+            .map(|pair| {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&pair[0]);
+                hasher.update(&pair[1]);
+                *hasher.finalize().as_bytes()
+            })
+            .collect();
+        if next.len() % 2 == 1 && next.len() != 1 {
+            next.push(MERKLE_EMPTY);
+        }
+        level = next;
+    }
+    level[0]
 }
 
 #[cfg(feature = "python")]
 #[pyo3::pyfunction]
-fn verify(statement_json: &str, proof: &[u8]) -> pyo3::PyResult<bool> {
-    Ok(verify_bytes(statement_json, proof)?)
+fn prove(
+    py: pyo3::Python<'_>,
+    statement_json: &str,
+    witness_json: &str,
+) -> pyo3::PyResult<Vec<u8>> {
+    py.detach(|| Ok(prove_bytes(statement_json, witness_json)?))
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn verify(py: pyo3::Python<'_>, statement_json: &str, proof: &[u8]) -> pyo3::PyResult<bool> {
+    py.detach(|| Ok(verify_bytes(statement_json, proof)?))
 }
 
 #[cfg(feature = "python")]
@@ -1308,10 +1868,85 @@ fn statement_digest(statement_json: &str) -> pyo3::PyResult<String> {
 
 #[cfg(feature = "python")]
 #[pyo3::pyfunction]
-fn adapter_commitment(adapter_json: &str) -> pyo3::PyResult<String> {
-    let input: AdapterCommitmentInput =
-        serde_json::from_str(adapter_json).map_err(|e| NativeError::Json(e.to_string()))?;
-    Ok(adapter_commitment_for_input(&input)?)
+fn adapter_commitment(py: pyo3::Python<'_>, adapter_json: &str) -> pyo3::PyResult<String> {
+    py.detach(|| {
+        let input: AdapterCommitmentInput =
+            serde_json::from_str(adapter_json).map_err(|e| NativeError::Json(e.to_string()))?;
+        Ok(adapter_commitment_for_input(&input)?)
+    })
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn compute_delta_quantized(
+    py: pyo3::Python<'_>,
+    a: Vec<Vec<i64>>,
+    b: Vec<Vec<i64>>,
+    x: Vec<i64>,
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> pyo3::PyResult<Vec<i64>> {
+    py.detach(|| {
+        Ok(compute_delta_quantized_native(
+            &a,
+            &b,
+            &x,
+            scaling_num,
+            scaling_den,
+            scale_bits,
+            value_bits,
+            intermediate_bits,
+        )?)
+    })
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn compute_delta_rows(
+    py: pyo3::Python<'_>,
+    a: Vec<Vec<i64>>,
+    b: Vec<Vec<i64>>,
+    xs: Vec<Vec<i64>>,
+    scaling_num: i64,
+    scaling_den: i64,
+    scale_bits: u32,
+    value_bits: u32,
+    intermediate_bits: u32,
+) -> pyo3::PyResult<Vec<Vec<i64>>> {
+    py.detach(|| {
+        Ok(compute_delta_rows_native(
+            &a,
+            &b,
+            &xs,
+            scaling_num,
+            scaling_den,
+            scale_bits,
+            value_bits,
+            intermediate_bits,
+        )?)
+    })
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn quantize_rows(
+    py: pyo3::Python<'_>,
+    rows: Vec<Vec<String>>,
+    scale_bits: u32,
+    value_bits: u32,
+) -> pyo3::PyResult<Vec<Vec<i64>>> {
+    py.detach(|| Ok(quantize_rows_exact(&rows, scale_bits, value_bits)?))
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn merkle_root(py: pyo3::Python<'_>, values: Vec<f64>, nonce: Vec<u8>) -> pyo3::PyResult<Vec<u8>> {
+    py.detach(|| Ok(merkle_root_f64(&values, &nonce).to_vec()))
 }
 
 #[cfg(feature = "python")]
@@ -1324,7 +1959,132 @@ fn _native_prover(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<
     m.add_function(wrap_pyfunction!(verify, m)?)?;
     m.add_function(wrap_pyfunction!(statement_digest, m)?)?;
     m.add_function(wrap_pyfunction!(adapter_commitment, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_delta_quantized, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_delta_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(quantize_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(merkle_root, m)?)?;
     Ok(())
+}
+
+#[doc(hidden)]
+pub mod bench_support {
+    //! Deterministic statement/witness generation for benchmarking only.
+
+    use super::*;
+
+    fn lcg_value(state: &mut u64, magnitude: i64) -> i64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let raw = (*state >> 16) as i64;
+        (raw % (2 * magnitude + 1)) - magnitude
+    }
+
+    fn div_round(numerator: &BigInt, denominator: &BigInt) -> BigInt {
+        let floor_half = denominator / BigInt::from(2u8);
+        (numerator + floor_half).div_floor(denominator)
+    }
+
+    pub fn bench_statement_and_witness(
+        in_dim: usize,
+        rank: usize,
+        out_dim: usize,
+    ) -> (String, String, u32) {
+        let fixed_point = FixedPointConfig {
+            scale_bits: 20,
+            value_bits: 63,
+            intermediate_bits: 127,
+        };
+        let scale = BigInt::one() << fixed_point.scale_bits;
+        let scaling_num = 1i64;
+        let scaling_den = 1i64;
+        let mut state = 0x5eed_5eed_5eed_5eedu64;
+        let magnitude = 1i64 << fixed_point.scale_bits;
+
+        let a: Vec<Vec<i64>> = (0..rank)
+            .map(|_| {
+                (0..in_dim)
+                    .map(|_| lcg_value(&mut state, magnitude))
+                    .collect()
+            })
+            .collect();
+        let b: Vec<Vec<i64>> = (0..out_dim)
+            .map(|_| {
+                (0..rank)
+                    .map(|_| lcg_value(&mut state, magnitude))
+                    .collect()
+            })
+            .collect();
+        let x: Vec<i64> = (0..in_dim)
+            .map(|_| lcg_value(&mut state, magnitude))
+            .collect();
+
+        let intermediate: Vec<BigInt> = a
+            .iter()
+            .map(|row| {
+                let raw: BigInt = row
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(w, xi)| BigInt::from(*w) * BigInt::from(*xi))
+                    .sum();
+                div_round(&raw, &scale)
+            })
+            .collect();
+        let delta: Vec<i64> = b
+            .iter()
+            .map(|row| {
+                let raw: BigInt = row
+                    .iter()
+                    .zip(intermediate.iter())
+                    .map(|(w, v)| BigInt::from(*w) * v)
+                    .sum();
+                let rescaled = div_round(&raw, &scale);
+                let scaled = rescaled * BigInt::from(scaling_num);
+                let out = div_round(&scaled, &BigInt::from(scaling_den));
+                i64::try_from(out).expect("bench delta fits i64")
+            })
+            .collect();
+
+        let adapter_input = AdapterCommitmentInput {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            in_dim,
+            rank,
+            out_dim,
+            fixed_point: fixed_point.clone(),
+            scaling_num,
+            scaling_den,
+            a: a.clone(),
+            b: b.clone(),
+        };
+        let commitment = adapter_commitment_for_input(&adapter_input).expect("commitment");
+
+        let statement = NativeStatement {
+            x,
+            delta,
+            fixed_point,
+            rank,
+            scaling_num,
+            scaling_den,
+            adapter_commitment: commitment,
+            statement_digest: "ab".repeat(32),
+        };
+        let witness = NativeWitness { a, b };
+        let statement_json = serde_json::to_string(&statement).expect("statement json");
+        let witness_json = serde_json::to_string(&witness).expect("witness json");
+        let circuit = circuit_from_json(&statement_json, &witness_json).expect("circuit");
+        let k = k_for(&circuit);
+        (statement_json, witness_json, k)
+    }
+
+    pub fn prove_verify_once(statement_json: &str, witness_json: &str) -> (f64, f64, usize) {
+        let prove_start = std::time::Instant::now();
+        let proof = prove_bytes(statement_json, witness_json).expect("prove");
+        let prove_ms = prove_start.elapsed().as_secs_f64() * 1000.0;
+        let verify_start = std::time::Instant::now();
+        assert!(verify_bytes(statement_json, &proof).expect("verify"));
+        let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+        (prove_ms, verify_ms, proof.len())
+    }
 }
 
 #[cfg(test)]
@@ -1414,6 +2174,50 @@ mod tests {
     }
 
     #[test]
+    fn mock_prover_accepts_extreme_in_bound_values() {
+        // Values sitting exactly on the signed bound exercise the zero-slack
+        // top-limb scaling of the lookup range checks.
+        let fixed_point = FixedPointConfig {
+            scale_bits: 0,
+            value_bits: 8,
+            intermediate_bits: 24,
+        };
+        let bound = (1i64 << (fixed_point.value_bits - 1)) - 1;
+        let input = AdapterCommitmentInput {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            in_dim: 2,
+            rank: 1,
+            out_dim: 1,
+            fixed_point: fixed_point.clone(),
+            scaling_num: 1,
+            scaling_den: 1,
+            a: vec![vec![bound, -bound]],
+            b: vec![vec![1]],
+        };
+        let x = vec![bound, bound];
+        // raw = bound*bound - bound*bound = 0; delta = 0.
+        let circuit = LoraCircuit {
+            a: input.a.clone(),
+            b: input.b.clone(),
+            x,
+            delta: vec![0],
+            fixed_point,
+            scaling_num: 1,
+            scaling_den: 1,
+            adapter_commitment: adapter_commitment_for_input(&input).unwrap(),
+            statement_digest: "44".repeat(32),
+        };
+        let instances = public_inputs(&circuit).unwrap();
+        let prover = MockProver::run(k_for(&circuit), &circuit, vec![instances]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
+
+        // One past the bound must be rejected before synthesis even starts.
+        let mut out_of_bound = circuit;
+        out_of_bound.x = vec![bound + 1, bound];
+        assert!(out_of_bound.validate().is_err());
+    }
+
+    #[test]
     fn mock_prover_rejects_tampered_delta_and_commitment() {
         let circuit = valid_circuit();
         let mut instances = public_inputs(&circuit).unwrap();
@@ -1430,7 +2234,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "IPA proof generation for the Poseidon/range-check circuit is intentionally slow"]
     fn real_proof_verifies_for_tiny_relation() {
         let circuit = minimal_circuit();
         let statement = NativeStatement {
@@ -1460,6 +2263,146 @@ mod tests {
         .unwrap();
         let tampered_json = serde_json::to_string(&tampered).unwrap();
         assert!(!verify_bytes(&tampered_json, &proof).unwrap());
+    }
+
+    #[test]
+    fn window_selection_depends_only_on_shape() {
+        let circuit = valid_circuit();
+        let (window, k) = circuit.window_and_k();
+        assert!((RANGE_WINDOW_MIN..=RANGE_WINDOW_MAX).contains(&window));
+        assert!(k >= 8);
+        // Witness values must not influence the selected circuit size.
+        let mut other = circuit.clone();
+        other.a = vec![vec![1, 1]];
+        other.b = vec![vec![-1], vec![1]];
+        other.x = vec![7, -7];
+        other.delta = vec![0, 0];
+        assert_eq!(other.window_and_k(), (window, k));
+        // The empty circuit used for key generation must agree as well.
+        assert_eq!(circuit.without_witnesses().window_and_k(), (window, k));
+    }
+
+    #[test]
+    fn mock_prover_accepts_multi_limb_range_checks() {
+        // value_bits=17 with window selection forces uneven top limbs in the
+        // running-sum decomposition; rank 2 exercises both matmul stages.
+        let fixed_point = FixedPointConfig {
+            scale_bits: 3,
+            value_bits: 17,
+            intermediate_bits: 40,
+        };
+        let input = AdapterCommitmentInput {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            in_dim: 5,
+            rank: 2,
+            out_dim: 3,
+            fixed_point: fixed_point.clone(),
+            scaling_num: 3,
+            scaling_den: 2,
+            a: vec![vec![100, -50, 25, -12, 6], vec![-99, 98, -97, 96, -95]],
+            b: vec![vec![40, -30], vec![-20, 10], vec![5, -5]],
+        };
+        let x = vec![64, -32, 16, -8, 4];
+        let scale = 1i64 << fixed_point.scale_bits;
+        let div_round = |n: i64, d: i64| -> i64 { (n + d / 2).div_euclid(d) };
+        let intermediate: Vec<i64> = input
+            .a
+            .iter()
+            .map(|row| {
+                let raw: i64 = row.iter().zip(x.iter()).map(|(w, xi)| w * xi).sum();
+                div_round(raw, scale)
+            })
+            .collect();
+        let delta: Vec<i64> = input
+            .b
+            .iter()
+            .map(|row| {
+                let raw: i64 = row
+                    .iter()
+                    .zip(intermediate.iter())
+                    .map(|(w, v)| w * v)
+                    .sum();
+                let rescaled = div_round(raw, scale);
+                div_round(rescaled * input.scaling_num, input.scaling_den)
+            })
+            .collect();
+        let circuit = LoraCircuit {
+            a: input.a.clone(),
+            b: input.b.clone(),
+            x,
+            delta,
+            fixed_point,
+            scaling_num: input.scaling_num,
+            scaling_den: input.scaling_den,
+            adapter_commitment: adapter_commitment_for_input(&input).unwrap(),
+            statement_digest: "33".repeat(32),
+        };
+        let instances = public_inputs(&circuit).unwrap();
+        let prover = MockProver::run(k_for(&circuit), &circuit, vec![instances]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
+
+        let mut tampered = public_inputs(&circuit).unwrap();
+        tampered[circuit.in_dim()] += Fp::from(1);
+        let prover = MockProver::run(k_for(&circuit), &circuit, vec![tampered]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn native_delta_helper_matches_circuit_relation() {
+        let circuit = valid_circuit();
+        let delta = compute_delta_quantized_native(
+            &circuit.a,
+            &circuit.b,
+            &circuit.x,
+            circuit.scaling_num,
+            circuit.scaling_den,
+            circuit.fixed_point.scale_bits,
+            circuit.fixed_point.value_bits,
+            circuit.fixed_point.intermediate_bits,
+        )
+        .unwrap();
+        assert_eq!(delta, circuit.delta);
+    }
+
+    #[test]
+    fn native_delta_reports_div_round_overflow_as_error() {
+        // intermediate = 2^62 - 1, raw_b = 2^65 - 8, and
+        // scaled = (2^65 - 8) * (2^62 + 1) = 2^127 - 8 fits i128, but adding
+        // scaling_den / 2 = 8 in the rounding step would overflow. The fast
+        // path must surface this as an error (so the Python caller falls back
+        // to the arbitrary-precision path) rather than panic or wrap.
+        let result = compute_delta_quantized_native(
+            &[vec![1]],
+            &[vec![8]],
+            &[(1i64 << 62) - 1],
+            (1i64 << 62) + 1,
+            17,
+            0,
+            63,
+            127,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn merkle_root_handles_padding_rules() {
+        let nonce = [7u8; 32];
+        assert_eq!(merkle_root_f64(&[], &nonce), MERKLE_EMPTY);
+        let single = merkle_root_f64(&[1.5], &nonce);
+        let pair = merkle_root_f64(&[1.5, 2.5], &nonce);
+        let triple = merkle_root_f64(&[1.5, 2.5, 3.5], &nonce);
+        assert_ne!(single, pair);
+        assert_ne!(pair, triple);
+        // Right-padding with the EMPTY leaf means a singleton tree hashes the
+        // leaf against EMPTY rather than returning the leaf itself.
+        let mut leaf = blake3::Hasher::new();
+        leaf.update(&1.5f64.to_be_bytes());
+        leaf.update(&nonce);
+        let leaf = *leaf.finalize().as_bytes();
+        let mut parent = blake3::Hasher::new();
+        parent.update(&leaf);
+        parent.update(&MERKLE_EMPTY);
+        assert_eq!(single, *parent.finalize().as_bytes());
     }
 
     #[test]

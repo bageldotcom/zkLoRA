@@ -5,13 +5,16 @@ import importlib
 import json
 import os
 import re
+import threading
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 
 
-BACKEND_ID = "zklora-halo2-v2"
+# v3: lookup-based range checks in the native circuit (same statement format,
+# same adapter commitment scheme; proofs/vk are not compatible with v2).
+BACKEND_ID = "zklora-halo2-v3"
 SCHEMA_VERSION = 2
 COMMITMENT_SCHEME = "sha256-canonical-lora-matrices-v1"
 ADAPTER_COMMITMENT_SCHEME = "poseidon-pasta-fp-adapter-v1"
@@ -143,6 +146,33 @@ def quantize_nested(values: Any, config: FixedPointConfig) -> Any:
     return quantize_scalar(values, config)
 
 
+def quantize_rows(rows: list[list[float]], config: FixedPointConfig) -> list[list[int]]:
+    """Quantize flat float rows with exact quantize_scalar semantics.
+
+    The native implementation reproduces Decimal(str(value)) round-half-up
+    rounding using exact integer arithmetic over the shortest round-trip
+    decimal representation; the Python path is the reference fallback.
+    """
+    if not rows:
+        return []
+    native = _native_module()
+    if native is not None and hasattr(native, "quantize_rows"):
+        try:
+            # str(float) is the semantic anchor of quantize_scalar; passing the
+            # strings keeps the native path bit-identical to Decimal(str(v)).
+            return [
+                [int(v) for v in row]
+                for row in native.quantize_rows(
+                    [[str(float(v)) for v in row] for row in rows],
+                    config.scale_bits,
+                    config.value_bits,
+                )
+            ]
+        except (OverflowError, TypeError, ValueError):
+            pass
+    return [[quantize_scalar(v, config) for v in row] for row in rows]
+
+
 def flatten(values: Any) -> list[int]:
     if isinstance(values, (list, tuple)):
         out: list[int] = []
@@ -186,6 +216,76 @@ def validate_matrix(matrix: list[list[int]], rows: int, cols: int, label: str) -
 
 
 def compute_delta_quantized(
+    a: list[list[int]],
+    b: list[list[int]],
+    x: list[int],
+    scaling_num: int,
+    scaling_den: int,
+    config: FixedPointConfig,
+) -> list[int]:
+    native = _native_module()
+    if native is not None and hasattr(native, "compute_delta_quantized"):
+        try:
+            return [
+                int(v)
+                for v in native.compute_delta_quantized(
+                    a,
+                    b,
+                    x,
+                    int(scaling_num),
+                    int(scaling_den),
+                    config.scale_bits,
+                    config.value_bits,
+                    config.intermediate_bits,
+                )
+            ]
+        except (OverflowError, TypeError, ValueError):
+            # Fall back to the exact arbitrary-precision path below; it either
+            # produces the result or raises the canonical contract error.
+            pass
+    return _compute_delta_quantized_python(a, b, x, scaling_num, scaling_den, config)
+
+
+def compute_delta_quantized_rows(
+    a: list[list[int]],
+    b: list[list[int]],
+    xs: list[list[int]],
+    scaling_num: int,
+    scaling_den: int,
+    config: FixedPointConfig,
+) -> list[list[int]]:
+    """Batched delta computation for multiple input rows of one adapter.
+
+    Uses the parallel native fast path when available (validating the adapter
+    once instead of per row), with the exact per-row implementation as
+    fallback. Results are identical to mapping compute_delta_quantized.
+    """
+    if not xs:
+        return []
+    native = _native_module()
+    if native is not None and hasattr(native, "compute_delta_rows"):
+        try:
+            return [
+                [int(v) for v in row]
+                for row in native.compute_delta_rows(
+                    a,
+                    b,
+                    xs,
+                    int(scaling_num),
+                    int(scaling_den),
+                    config.scale_bits,
+                    config.value_bits,
+                    config.intermediate_bits,
+                )
+            ]
+        except (OverflowError, TypeError, ValueError):
+            pass
+    return [
+        compute_delta_quantized(a, b, x, scaling_num, scaling_den, config) for x in xs
+    ]
+
+
+def _compute_delta_quantized_python(
     a: list[list[int]],
     b: list[list[int]],
     x: list[int],
@@ -261,6 +361,15 @@ def adapter_commitment_payload(
     }
 
 
+_ADAPTER_COMMITMENT_CACHE: dict[tuple, str] = {}
+_ADAPTER_COMMITMENT_CACHE_MAX = 64
+_ADAPTER_COMMITMENT_LOCK = threading.Lock()
+
+
+def _freeze_matrix(matrix: list[list[int]]) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(int(v) for v in row) for row in matrix)
+
+
 def adapter_commitment(
     a: list[list[int]],
     b: list[list[int]],
@@ -268,18 +377,39 @@ def adapter_commitment(
     scaling_den: int,
     fixed_point: FixedPointConfig,
 ) -> str:
+    # The commitment is recomputed for every invocation statement of a module,
+    # over the same (large) adapter matrices. Content-keyed memoisation keeps
+    # the Poseidon chain to one evaluation per adapter. The backend identity is
+    # part of the key so monkeypatched/fake backends never share entries.
     native = _native_module()
     if native is None:
         raise ProofContractError(
             "native Halo2 prover is unavailable; build/install zklora with maturin"
         )
-    return str(
+    key = (
+        id(native),
+        _freeze_matrix(a),
+        _freeze_matrix(b),
+        int(scaling_num),
+        int(scaling_den),
+        fixed_point,
+    )
+    with _ADAPTER_COMMITMENT_LOCK:
+        cached = _ADAPTER_COMMITMENT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value = str(
         native.adapter_commitment(
             canonical_json(
                 adapter_commitment_payload(a, b, scaling_num, scaling_den, fixed_point)
             )
         )
     )
+    with _ADAPTER_COMMITMENT_LOCK:
+        if len(_ADAPTER_COMMITMENT_CACHE) >= _ADAPTER_COMMITMENT_CACHE_MAX:
+            _ADAPTER_COMMITMENT_CACHE.pop(next(iter(_ADAPTER_COMMITMENT_CACHE)))
+        _ADAPTER_COMMITMENT_CACHE[key] = value
+    return value
 
 
 def circuit_id(
@@ -499,6 +629,16 @@ def write_invocation_artifacts(
         "statement": str(statement_path),
         "meta": str(meta_path),
     }
+
+
+def _worker_count(env_var: str) -> int:
+    try:
+        configured = int(os.environ.get(env_var, ""))
+    except ValueError:
+        configured = 0
+    if configured > 0:
+        return configured
+    return max(os.cpu_count() or 1, 1)
 
 
 def load_json(path: str | os.PathLike[str]) -> dict[str, Any]:
@@ -722,6 +862,7 @@ def verify_artifacts(
     | Iterable[dict[str, Any]],
 ) -> tuple[float, int]:
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     start = time.time()
     entries = load_transcript(transcript)
@@ -738,7 +879,21 @@ def verify_artifacts(
         if key in seen:
             raise ProofContractError(f"duplicate proof statement for {key}")
         seen.add(key)
-        verify_artifact_set(statement_file, entries, adapter_index)
+
+    # Every artifact is verified independently; the native verifier releases
+    # the GIL, so a small thread pool overlaps proof verification across files.
+    max_workers = min(len(statement_files), _worker_count("ZKLORA_VERIFY_WORKERS"))
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(verify_artifact_set, statement_file, entries, adapter_index)
+                for statement_file in statement_files
+            ]
+            for future in futures:
+                future.result()
+    else:
+        for statement_file in statement_files:
+            verify_artifact_set(statement_file, entries, adapter_index)
 
     expected = {entry.key() for entry in entries}
     if seen != expected:

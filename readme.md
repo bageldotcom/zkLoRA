@@ -357,7 +357,10 @@ For detailed information about the codebase organization and implementation deta
 <td>✓</td><td><strong>Adapter Weight Privacy:</strong> LoRA weights remain confidential while the committed adapter identity is checked</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Benchmark Required:</strong> Real-shape proving and verification performance should be measured for each deployment target</td>
+<td>✓</td><td><strong>Benchmark Required:</strong> Real-shape proving and verification performance should be measured for each deployment target (see <code>benchmarks/run_benchmarks.py</code> and <code>cargo run --release --example bench_prove</code>)</td>
+</tr>
+<tr>
+<td>✓</td><td><strong>Fast Native Backend (v3):</strong> Lookup-based range checks, shape-keyed SRS/key caches, and parallel batch proving/verification deliver order-of-magnitude speedups over v2 while keeping the same statement format and adapter commitment scheme</td>
 </tr>
 </table>
 

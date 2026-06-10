@@ -1,3 +1,4 @@
+import hashlib
 import socket
 import threading
 import os
@@ -14,9 +15,9 @@ from ..proof_contract import (
     FixedPointConfig,
     InvocationWitness,
     adapter_manifest_entry,
-    compute_delta_quantized,
-    flatten,
+    compute_delta_quantized_rows,
     quantize_nested,
+    quantize_rows,
     write_adapter_manifest,
 )
 
@@ -77,29 +78,61 @@ class LoRAServer:
         self._invocation_counts: dict[tuple[str, str], int] = {}
         self.last_scaling: tuple[int, int] = (1, 1)
         self.last_q_delta: list[list[int]] = []
+        self._module_cache: dict[str, dict] = {}
+        self._module_cache_lock = threading.Lock()
 
     def list_lora_injection_points(self):
         return list(self.submodules.keys())
 
+    def _module_artifacts(self, sub_name: str) -> dict:
+        """Quantize a module's LoRA matrices once and reuse them everywhere.
+
+        Quantization runs element-wise through Decimal for exact round-half-up
+        semantics, which is far too slow to repeat on every invocation. The
+        cache is keyed on the current weight bytes and scaling, so a module
+        whose adapter weights are swapped or updated in place is re-quantized
+        instead of being served stale matrices.
+        """
+        module = self.submodules[sub_name]
+        a_matrix, b_matrix, scaling_num, scaling_den = lora_matrices_and_scaling(module)
+        fingerprint = (
+            hashlib.sha256(a_matrix.numpy().tobytes()).digest(),
+            hashlib.sha256(b_matrix.numpy().tobytes()).digest(),
+            int(scaling_num),
+            int(scaling_den),
+        )
+        with self._module_cache_lock:
+            cached = self._module_cache.get(sub_name)
+        if cached is not None and cached["fingerprint"] == fingerprint:
+            return cached
+        artifacts = {
+            "fingerprint": fingerprint,
+            "a_matrix": a_matrix,
+            "b_matrix": b_matrix,
+            "scaling_num": int(scaling_num),
+            "scaling_den": int(scaling_den),
+            "a_quantized": quantize_nested(
+                a_matrix.detach().cpu().numpy().tolist(), self.fixed_point
+            ),
+            "b_quantized": quantize_nested(
+                b_matrix.detach().cpu().numpy().tolist(), self.fixed_point
+            ),
+        }
+        with self._module_cache_lock:
+            self._module_cache[sub_name] = artifacts
+        return artifacts
+
     def adapter_manifest_entries(self):
         entries = []
-        for sub_name, module in self.submodules.items():
-            a_matrix, b_matrix, scaling_num, scaling_den = lora_matrices_and_scaling(
-                module
-            )
-            a_quantized = quantize_nested(
-                a_matrix.detach().cpu().numpy().tolist(), self.fixed_point
-            )
-            b_quantized = quantize_nested(
-                b_matrix.detach().cpu().numpy().tolist(), self.fixed_point
-            )
+        for sub_name in self.submodules:
+            artifacts = self._module_artifacts(sub_name)
             entries.append(
                 adapter_manifest_entry(
                     sub_name,
-                    a_quantized,
-                    b_quantized,
-                    scaling_num,
-                    scaling_den,
+                    artifacts["a_quantized"],
+                    artifacts["b_quantized"],
+                    artifacts["scaling_num"],
+                    artifacts["scaling_den"],
                     self.fixed_point,
                 )
             )
@@ -116,11 +149,20 @@ class LoRAServer:
     ):
         if sub_name not in self.submodules:
             raise ValueError(f"[LoRAServer] submodule '{sub_name}' not recognized.")
-        mod = self.submodules[sub_name]
         print(f"[A] apply_lora on '{sub_name}', shape={list(input_tensor.shape)}")
+        artifacts = self._module_artifacts(sub_name)
+        a_matrix = artifacts["a_matrix"]
+        b_matrix = artifacts["b_matrix"]
+        scaling_num = artifacts["scaling_num"]
+        scaling_den = artifacts["scaling_den"]
+        a_quantized = artifacts["a_quantized"]
+        b_quantized = artifacts["b_quantized"]
+        scaling = scaling_num / scaling_den
         with torch.no_grad():
-            delta_float, a_matrix, b_matrix, scaling_num, scaling_den = (
-                compute_lora_delta(mod, input_tensor)
+            x_float = input_tensor.float()
+            delta_float = (
+                torch.matmul(torch.matmul(x_float, a_matrix.t()), b_matrix.t())
+                * scaling
             )
         self.last_scaling = (int(scaling_num), int(scaling_den))
         self.last_q_delta = []
@@ -128,25 +170,19 @@ class LoRAServer:
         sid = session_id or "default-session"
         key = (sid, sub_name)
         x_rows = input_tensor.detach().cpu().float().reshape(-1, int(a_matrix.shape[1]))
+        q_x_rows = quantize_rows(
+            [x_row.cpu().numpy().tolist() for x_row in x_rows], self.fixed_point
+        )
+        q_delta_rows = compute_delta_quantized_rows(
+            a_quantized,
+            b_quantized,
+            q_x_rows,
+            scaling_num,
+            scaling_den,
+            self.fixed_point,
+        )
         delta_rows = []
-        a_quantized = quantize_nested(
-            a_matrix.detach().cpu().numpy().tolist(), self.fixed_point
-        )
-        b_quantized = quantize_nested(
-            b_matrix.detach().cpu().numpy().tolist(), self.fixed_point
-        )
-        for x_row in x_rows:
-            q_x = flatten(
-                quantize_nested(x_row.cpu().numpy().tolist(), self.fixed_point)
-            )
-            q_delta = compute_delta_quantized(
-                a_quantized,
-                b_quantized,
-                q_x,
-                scaling_num,
-                scaling_den,
-                self.fixed_point,
-            )
+        for q_x, q_delta in zip(q_x_rows, q_delta_rows):
             delta_rows.append([int(v) for v in q_delta])
             invocation_index = self._invocation_counts.get(key, 0)
             self._invocation_counts[key] = invocation_index + 1
@@ -219,6 +255,8 @@ class LoRAServerSocket(threading.Thread):
         self.lora_server = lora_server
         self.stop_event = stop_event
         self.stop_timeout = stop_timeout
+        self._server_lock = threading.Lock()
+        self._conn_threads: list[threading.Thread] = []
 
     def run(self):
         print(f"[A-Server] listening on {self.host}:{self.port}")
@@ -236,8 +274,16 @@ class LoRAServerSocket(threading.Thread):
                     conn, addr = srv.accept()
                 except socket.timeout:
                     continue
-                self.handle_conn(conn, addr)
+                worker = threading.Thread(
+                    target=self.handle_conn, args=(conn, addr), daemon=True
+                )
+                worker.start()
+                self._conn_threads = [t for t in self._conn_threads if t.is_alive()] + [
+                    worker
+                ]
         finally:
+            for worker in self._conn_threads:
+                worker.join(timeout=self.stop_timeout)
             srv.close()
             print("[A-Server] shutting down...")
 
@@ -257,19 +303,23 @@ class LoRAServerSocket(threading.Thread):
                 arr = req["input_array"]
                 session_id = req.get("session_id")
                 tin = torch.tensor(arr, dtype=torch.float32)
-                out = self.lora_server.apply_lora(sname, tin, session_id=session_id)
-                resp = {
-                    "response_type": "lora_forward_response",
-                    "output_array": out.cpu().numpy(),
-                    "q_delta": self.lora_server.last_q_delta,
-                    "scaling_num": int(self.lora_server.last_scaling[0]),
-                    "scaling_den": int(self.lora_server.last_scaling[1]),
-                }
+                # The lock keeps apply_lora and the last_* snapshot atomic when
+                # multiple clients are connected concurrently.
+                with self._server_lock:
+                    out = self.lora_server.apply_lora(sname, tin, session_id=session_id)
+                    resp = {
+                        "response_type": "lora_forward_response",
+                        "output_array": out.cpu().numpy(),
+                        "q_delta": self.lora_server.last_q_delta,
+                        "scaling_num": int(self.lora_server.last_scaling[0]),
+                        "scaling_den": int(self.lora_server.last_scaling[1]),
+                    }
 
             elif rtype == "end_inference":
-                self.lora_server.finalize_proofs_and_collect(
-                    session_id=req.get("session_id")
-                )
+                with self._server_lock:
+                    self.lora_server.finalize_proofs_and_collect(
+                        session_id=req.get("session_id")
+                    )
                 resp = {
                     "response_type": "end_inference_ack",
                     "message": "A finished native zkLoRA proof generation locally.",

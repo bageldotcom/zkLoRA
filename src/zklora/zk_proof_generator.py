@@ -26,7 +26,9 @@ def generate_proofs(
     no-records result instead of importing removed proof backends.
     """
 
+    import os
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     start = time.time()
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -39,15 +41,34 @@ def generate_proofs(
             "native zkLoRA proof generation requires captured invocation records"
         )
 
-    for record in record_list:
+    def _generate(record: InvocationWitness) -> None:
         write_invocation_artifacts(output_dir, record)
-        total_params += record.rank * record.in_dim + record.out_dim * record.rank
-        proofs += 1
         if verbose:
             print(
                 f"Generated native zkLoRA proof artifact for "
                 f"{record.module_name}#{record.invocation_index}"
             )
+
+    # The native prover releases the GIL, so independent invocation proofs can
+    # be generated concurrently; artifact paths are unique per record.
+    try:
+        configured = int(os.environ.get("ZKLORA_PROVE_WORKERS", ""))
+    except ValueError:
+        configured = 0
+    max_workers = configured if configured > 0 else max(os.cpu_count() or 1, 1)
+    max_workers = min(len(record_list), max_workers)
+    if max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_generate, record) for record in record_list]
+            for future in futures:
+                future.result()
+    else:
+        for record in record_list:
+            _generate(record)
+
+    for record in record_list:
+        total_params += record.rank * record.in_dim + record.out_dim * record.rank
+        proofs += 1
 
     elapsed = time.time() - start
     return (0.0, 0.0, elapsed, total_params, proofs)

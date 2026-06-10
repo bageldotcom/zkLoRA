@@ -56,7 +56,18 @@ The Rust implementation is wrapped with Python bindings in the `libs/merkle` dir
 
 ### Performance Considerations
 
-Native Halo2 performance should be measured for the specific LoRA shapes being proven. The v2 implementation prioritizes proof-contract correctness, transcript binding, and pre-agreed adapter binding before publishing benchmark claims.
+Native Halo2 performance should be measured for the specific LoRA shapes being proven. The v3 backend keeps the v2 proof contract (same statement format, same Poseidon adapter-commitment scheme) while making proving and verification dramatically faster:
+
+- **Lookup-based range checks**: signed interval checks decompose values into window-sized limbs via a running sum constrained against a lookup table, instead of one boolean row per bit. The interval semantics are exact (the top limb is scaled to its residual width), and the circuit drops provably redundant per-product checks whose bounds already follow from the range-checked operands. At a 768×4×2304 LoRA shape this reduces the circuit from k≈26 to k=21 (32× fewer rows).
+- **Keyed SRS/proving-key/verifying-key caches**: params and keys are derived deterministically from the statement shape (dims, fixed-point bits, scaling) and reused across invocations of the same module. First proof per shape pays keygen; subsequent proofs and all verifications are keygen-free. Cache sizes are tunable via `ZKLORA_PARAMS_CACHE_CAP`, `ZKLORA_PK_CACHE_CAP`, and `ZKLORA_VK_CACHE_CAP`.
+- **Parallel batch operations**: the PyO3 bindings release the GIL, and `generate_proofs` / `batch_verify_proofs` fan out across a thread pool (`ZKLORA_PROVE_WORKERS`, `ZKLORA_VERIFY_WORKERS`).
+- **Native fast paths with exact fallbacks**: quantized delta computation and the hiding Merkle commitment have Rust implementations that are value-identical to the Python reference paths (covered by parity tests); the Python implementations remain as exact fallbacks.
+
+Proofs and verifying keys from the v2 backend are not compatible with v3 (the `backend` field in statements changed to `zklora-halo2-v3`), but pinned adapter manifests remain valid: the adapter commitment scheme is unchanged.
+
+Measured on a 4-core machine (warm key cache): a 2×1×2 relation proves in ~0.7s and verifies in ~0.02s (previously ~23s / ~18s), an 8×2×8 relation proves in ~1.4s (previously >5 minutes), and the real 768×4×2304 c_attn shape becomes feasible at k=21.
+
+Memory note: proving memory is dominated by halo2's extended-domain evaluations (the Poseidon chip's gate degree implies an 8× extended domain), and halo2 0.3 keeps all advice cosets resident during proof creation. Measured on a 15 GB host: a k=19 shape (768×2×256) proves in 81 s warm with a 12.1 GB peak, while k=20 and k=21 shapes (e.g. 768×4×768 and the full 768×4×2304 c_attn) exceed 15 GB and require a 32–64 GB prover host. Verification is lightweight once the verifying key is cached.
 
 For detailed usage examples and high-level architecture, please refer to the [main README](../../README.md) in the project root.
 
