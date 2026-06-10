@@ -1003,13 +1003,27 @@ fn range_check_signed_interval(
     range_check_unsigned(region, config, window, &diff_cell, &diff, bits, offset)
 }
 
-/// Constrain `value_cell` to `[0, 2^bits)` using a lookup-backed running sum.
+/// Constrain `value_cell` to a small non-negative integer using a
+/// lookup-backed running sum.
 ///
 /// Row `offset + i` holds `z_i` in `advice[3]`; the lookup argument enforces
 /// `scale_i * (z_i - z_{i+1} * 2^window) ∈ [0, 2^window)` per active row, with
-/// `scale_i = 2^(window - top_bits)` on the final limb so the decomposition
-/// covers exactly `bits` bits. `z_n` is constrained to zero, so the chain
-/// telescopes to `z_0 = value < 2^bits` with every limb non-negative.
+/// `scale_i = 2^(window - top_bits)` on the final limb and `z_n` constrained
+/// to zero.
+///
+/// Soundness: telescoping the chain over the field gives
+/// `z_0 = Σ_{i<n-1} limb_i·2^{window·i} + limb_{n-1}·2^{window·(n-2)+top_bits}`
+/// with every `limb_i ∈ [0, 2^window)` from the table. The top-limb term is
+/// bounded by `2^bits` and the lower limbs by `2^{window·(n-1)}`, so
+/// `z_0 < 2^{bits+1}` as an integer — there is at most a factor-2 slack here,
+/// NOT an exact `2^bits` cut-off (a prover can choose a top limb that is not
+/// a multiple of `2^{window-top_bits}`, making `z_{n-1}` itself a large field
+/// element while `2^{window·(n-1)}·z_{n-1}` stays small). Callers must not
+/// rely on tightness: `range_check_signed_interval` derives its EXACT bound
+/// from checking both `shifted` and `diff = max - shifted` with this routine
+/// and constraining `shifted + diff = max`; since both are non-negative
+/// integers below `2^{bits+1}` and `2^{bits+2} < p`, the sum cannot wrap and
+/// `shifted ∈ [0, max]` holds exactly.
 fn range_check_unsigned(
     region: &mut halo2_proofs::circuit::Region<'_, Fp>,
     config: &LoraConfig,
@@ -2155,6 +2169,50 @@ mod tests {
         let instances = public_inputs(&circuit).unwrap();
         let prover = MockProver::run(k_for(&circuit), &circuit, vec![instances]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
+    }
+
+    #[test]
+    fn mock_prover_accepts_extreme_in_bound_values() {
+        // Values sitting exactly on the signed bound exercise the zero-slack
+        // top-limb scaling of the lookup range checks.
+        let fixed_point = FixedPointConfig {
+            scale_bits: 0,
+            value_bits: 8,
+            intermediate_bits: 24,
+        };
+        let bound = (1i64 << (fixed_point.value_bits - 1)) - 1;
+        let input = AdapterCommitmentInput {
+            schema_version: ARTIFACT_SCHEMA_VERSION,
+            in_dim: 2,
+            rank: 1,
+            out_dim: 1,
+            fixed_point: fixed_point.clone(),
+            scaling_num: 1,
+            scaling_den: 1,
+            a: vec![vec![bound, -bound]],
+            b: vec![vec![1]],
+        };
+        let x = vec![bound, bound];
+        // raw = bound*bound - bound*bound = 0; delta = 0.
+        let circuit = LoraCircuit {
+            a: input.a.clone(),
+            b: input.b.clone(),
+            x,
+            delta: vec![0],
+            fixed_point,
+            scaling_num: 1,
+            scaling_den: 1,
+            adapter_commitment: adapter_commitment_for_input(&input).unwrap(),
+            statement_digest: "44".repeat(32),
+        };
+        let instances = public_inputs(&circuit).unwrap();
+        let prover = MockProver::run(k_for(&circuit), &circuit, vec![instances]).unwrap();
+        assert_eq!(prover.verify(), Ok(()));
+
+        // One past the bound must be rejected before synthesis even starts.
+        let mut out_of_bound = circuit;
+        out_of_bound.x = vec![bound + 1, bound];
+        assert!(out_of_bound.validate().is_err());
     }
 
     #[test]
