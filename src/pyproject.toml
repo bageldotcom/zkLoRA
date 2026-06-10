@@ -10,7 +10,10 @@ authors = [
 ]
 description = "A Python library for zero-knowledge proof generation and verification"
 readme = "../readme.md"  # Update path to point to root README
-requires-python = ">=3.8"
+# Floor matches actual usage: PEP 604 unions evaluated at import time in
+# lora_contributor_mpi require 3.10+, and pathlib.Path.is_relative_to
+# requires 3.9+. CI exercises 3.11.
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: Other/Proprietary License",

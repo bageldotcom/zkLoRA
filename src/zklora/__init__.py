@@ -13,6 +13,7 @@ _LAZY_EXPORTS = {
     "generate_proofs": ("zklora.zk_proof_generator", "generate_proofs"),
     "adapter_manifest_entry": ("zklora.proof_contract", "adapter_manifest_entry"),
     "write_adapter_manifest": ("zklora.proof_contract", "write_adapter_manifest"),
+    "expand_statement_rows": ("zklora.proof_v3", "expand_statement_rows"),
     "commit_activations": ("zklora.polynomial_commit", "commit_activations"),
     "verify_commitment": ("zklora.polynomial_commit", "verify_commitment"),
 }

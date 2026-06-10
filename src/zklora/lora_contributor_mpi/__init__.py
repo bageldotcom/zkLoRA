@@ -8,7 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM
 from peft import PeftModel
 
-from ..zk_proof_generator import generate_proofs
+from ..zk_proof_generator import generate_proofs, prover_backend
 from ..base_model_user_mpi import _recv_json_message, _send_json_message
 from ..proof_contract import (
     FixedPointConfig,
@@ -18,6 +18,14 @@ from ..proof_contract import (
     flatten,
     quantize_nested,
     write_adapter_manifest,
+)
+from ..proof_v3 import (
+    adapter_manifest_entry_v3,
+    adapter_manifest_payload_v3,
+    ensure_secret_outside_artifacts,
+    load_or_create_contributor_secret,
+    resolve_contributor_secret_path,
+    write_adapter_manifest_v3,
 )
 
 
@@ -46,10 +54,19 @@ class LoRAServer:
         lora_model_id: str,
         out_dir: str,
         fixed_point: FixedPointConfig | None = None,
+        manifest_secret_path: str | None = None,
     ):
         self.out_dir = out_dir
         self.fixed_point = fixed_point or FixedPointConfig()
         os.makedirs(self.out_dir, exist_ok=True)
+        # Contributor secret seed for hiding adapter commitments. It must never
+        # live inside out_dir, which is handed to the verifier as-is.
+        self.manifest_secret_path = resolve_contributor_secret_path(
+            manifest_secret_path
+        )
+        ensure_secret_outside_artifacts(self.manifest_secret_path, self.out_dir)
+        self._manifest_entries: list | None = None
+        self._manifest_payload: dict | None = None
 
         # 1) Load model, disable cache => no 'past_key_values'
         base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
@@ -82,6 +99,15 @@ class LoRAServer:
         return list(self.submodules.keys())
 
     def adapter_manifest_entries(self):
+        legacy = prover_backend() == "legacy-halo2"
+        if not legacy and self._manifest_entries is not None:
+            # Schema-3 entries carry a fresh commitment nonce; the same entries
+            # must back both the pinned manifest and every later proof, so they
+            # are built once per server run.
+            return self._manifest_entries
+        secret = None
+        if not legacy:
+            secret = load_or_create_contributor_secret(self.manifest_secret_path)
         entries = []
         for sub_name, module in self.submodules.items():
             a_matrix, b_matrix, scaling_num, scaling_den = lora_matrices_and_scaling(
@@ -93,20 +119,40 @@ class LoRAServer:
             b_quantized = quantize_nested(
                 b_matrix.detach().cpu().numpy().tolist(), self.fixed_point
             )
-            entries.append(
-                adapter_manifest_entry(
-                    sub_name,
-                    a_quantized,
-                    b_quantized,
-                    scaling_num,
-                    scaling_den,
-                    self.fixed_point,
+            if legacy:
+                entries.append(
+                    adapter_manifest_entry(
+                        sub_name,
+                        a_quantized,
+                        b_quantized,
+                        scaling_num,
+                        scaling_den,
+                        self.fixed_point,
+                    )
                 )
-            )
+            else:
+                entries.append(
+                    adapter_manifest_entry_v3(
+                        sub_name,
+                        a_quantized,
+                        b_quantized,
+                        scaling_num,
+                        scaling_den,
+                        self.fixed_point,
+                        secret,
+                    )
+                )
+        if not legacy:
+            self._manifest_entries = entries
         return entries
 
     def write_adapter_manifest(self, path: str):
-        write_adapter_manifest(path, self.adapter_manifest_entries())
+        entries = self.adapter_manifest_entries()
+        if prover_backend() == "legacy-halo2":
+            write_adapter_manifest(path, entries)
+            self._manifest_payload = None
+        else:
+            self._manifest_payload = write_adapter_manifest_v3(path, entries)
 
     def apply_lora(
         self,
@@ -190,11 +236,25 @@ class LoRAServer:
         else:
             records = self.session_data.pop(session_id, [])
 
-        proof_res = generate_proofs(
-            records=records,
-            output_dir=self.out_dir,
-            verbose=True,
-        )
+        if prover_backend() == "legacy-halo2":
+            proof_res = generate_proofs(
+                records=records,
+                output_dir=self.out_dir,
+                verbose=True,
+            )
+        else:
+            if self._manifest_payload is None:
+                # Pin the same entries the verifier will receive out-of-band.
+                self._manifest_payload = adapter_manifest_payload_v3(
+                    self.adapter_manifest_entries()
+                )
+            proof_res = generate_proofs(
+                records=records,
+                output_dir=self.out_dir,
+                verbose=True,
+                adapter_manifest=self._manifest_payload,
+                manifest_secret_path=self.manifest_secret_path,
+            )
 
         if not proof_res:
             print("[A] No proofs generated or something went wrong.")
