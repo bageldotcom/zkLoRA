@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 import sys
@@ -26,14 +27,22 @@ import zklora.proof_contract as proof_contract
 
 
 class FakeNative:
-    def adapter_commitment(self, adapter_json):
-        return str(abs(hash(adapter_json)))
+    def adapter_commitment_v4(self, adapter_json, salt):
+        return hashlib.sha256(f"{salt}|{adapter_json}".encode()).hexdigest()
 
-    def prove(self, statement_json, witness_json):
+    def adapter_setup_v4(self, adapter_json, salt):
+        return json.dumps(
+            {"core": {"digest": self.adapter_commitment_v4(adapter_json, salt)}}
+        )
+
+    def prove_v4(self, statement_json, witness_json, salt):
         return f"{statement_json}|{witness_json}".encode()
 
-    def verify(self, statement_json, proof):
+    def verify_v4(self, statement_json, proof, setup_json):
         return proof.startswith(statement_json.encode() + b"|")
+
+    def verify_adapter_setup_v4(self, setup_json):
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -100,7 +109,7 @@ def test_statement_round_trip_is_canonical_and_transcript_bound(tmp_path):
     meta = load_json(paths["meta"])
     transcript_entry = transcript_entry_from_statement(statement)
 
-    assert meta["proof_kind"] == "native-halo2"
+    assert meta["proof_kind"] == "native-sigma-v4"
     total_time, count = verify_artifacts(
         tmp_path, [transcript_entry], _manifest_for(witness)
     )
@@ -144,9 +153,7 @@ def test_expected_adapter_manifest_mismatch_rejects(tmp_path):
     statement = load_json(paths["statement"])
     transcript = [transcript_entry_from_statement(statement)]
     manifest = _manifest_for(witness)
-    manifest[0]["adapter_commitment"]["value"] = str(
-        int(manifest[0]["adapter_commitment"]["value"]) + 1
-    )
+    manifest[0]["adapter_commitment"]["value"] = "0" * 64
 
     with pytest.raises(ProofContractError, match="expected adapter manifest"):
         verify_artifacts(tmp_path, transcript, manifest)
@@ -174,9 +181,7 @@ def test_tampered_vk_and_proof_reject(tmp_path):
 
     paths = write_invocation_artifacts(tmp_path, witness)
     statement = load_json(paths["statement"])
-    statement["adapter_commitment"]["value"] = str(
-        int(statement["adapter_commitment"]["value"]) + 1
-    )
+    statement["adapter_commitment"]["value"] = "0" * 64
     statement["statement_digest"] = "00" * 32
     Path(paths["statement"]).write_text(
         json.dumps(statement, sort_keys=True, separators=(",", ":")) + "\n",

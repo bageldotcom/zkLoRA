@@ -30,7 +30,7 @@ Low-Rank Adaptation (LoRA) is a widely adopted method for customizing large-scal
 
 To solve this, we created **zkLoRA** a zero-knowledge verification protocol that relies on commitments, succinct proofs, and multi-party inference to verify exact LoRA delta computation for a pre-agreed adapter without exposing LoRA weights.
 
-This implementation uses a native Halo2 backend for transcript-bound proof artifacts. The v2 proof contract verifies exact quantized LoRA delta correctness for the statement the base user actually sent and received, and binds the proof to a pre-inference adapter manifest. It does not claim an end-to-end proof that the base model computed those activations.
+This implementation uses a native commit-and-prove backend (sigma-v4) for transcript-bound proof artifacts. The proof contract verifies exact quantized LoRA delta correctness for the statement the base user actually sent and received, and binds the proof to a pre-inference adapter manifest. It does not claim an end-to-end proof that the base model computed those activations.
 
 Verifier trust boundary: `expected_adapters` must be obtained and pinned by the verifier out-of-band before inference starts, for example by recording the exact manifest file or digest. A contributor-generated adapter manifest is only a convenience handoff artifact; if it is first generated after inference or supplied only alongside proofs, it is not trusted verifier input.
 
@@ -348,7 +348,7 @@ For detailed information about the codebase organization and implementation deta
 <td>✓</td><td><strong>Trust-Minimized Delta Verification:</strong> Zero-knowledge proofs validate exact quantized LoRA deltas for a pre-agreed adapter</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Native Halo2 Backend:</strong> Proofs no longer depend on EZKL/ONNX artifacts</td>
+<td>✓</td><td><strong>Native Sigma-v4 Backend:</strong> Commit-and-prove protocol over ristretto255; per-proof cost no longer scales with adapter size, so every real LoRA shape proves in milliseconds-to-subsecond on a laptop-class host (previously minutes to infeasible). Legacy Halo2 (v3) artifacts remain verifiable</td>
 </tr>
 <tr>
 <td>✓</td><td><strong>Multi-Party Inference:</strong> Protected activation exchange between parties</td>
@@ -357,10 +357,10 @@ For detailed information about the codebase organization and implementation deta
 <td>✓</td><td><strong>Adapter Weight Privacy:</strong> LoRA weights remain confidential while the committed adapter identity is checked</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Benchmark Required:</strong> Real-shape proving and verification performance should be measured for each deployment target (see <code>benchmarks/run_benchmarks.py</code> and <code>cargo run --release --example bench_prove</code>)</td>
+<td>✓</td><td><strong>Benchmark Required:</strong> Real-shape proving and verification performance should be measured for each deployment target (see <code>benchmarks/run_benchmarks.py</code>, <code>benchmarks/sigma_v4_results.md</code>, and <code>cargo run --release --example bench_prove</code>)</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Fast Native Backend (v3):</strong> Lookup-based range checks, shape-keyed SRS/key caches, and parallel batch proving/verification deliver order-of-magnitude speedups over v2 while keeping the same statement format and adapter commitment scheme</td>
+<td>✓</td><td><strong>Fast Backend (v4):</strong> Pedersen-committed adapters with one-time exact weight range proofs, Fiat-Shamir random-projection sigma protocols for the quantized LoRA relation, and a zero-knowledge sumcheck LogUp range engine deliver 300-1100× faster proving than v3 on previously-feasible shapes and make all real LoRA shapes feasible, with the same statement semantics, the same discrete-log assumption class, and improved (salted, perfectly hiding) adapter commitments</td>
 </tr>
 </table>
 
@@ -376,7 +376,10 @@ zkLoRA is built upon these outstanding open source projects:
 | [Transformers](https://github.com/huggingface/transformers) | State-of-the-art Natural Language Processing |
 | [dusk-merkle](https://github.com/dusk-network/dusk-merkle) | Merkle tree implementation in Rust |
 | [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) | Cryptographic hash function |
-| [Halo2](https://github.com/zcash/halo2) | Native zero-knowledge proving system used by the zkLoRA backend |
+| [curve25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) | Ristretto255 group arithmetic underlying the sigma-v4 backend |
+| [Bulletproofs](https://github.com/dalek-cryptography/bulletproofs) | Aggregated range proofs for one-time adapter setup |
+| [merlin](https://github.com/dalek-cryptography/merlin) | Fiat-Shamir transcripts |
+| [Halo2](https://github.com/zcash/halo2) | Proving system used by the legacy v3 backend |
 
 <hr>
 
