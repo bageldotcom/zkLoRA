@@ -28,6 +28,15 @@ Proving memory drops from gigabytes (12.1 GB at k=19; OOM beyond) to tens of
 megabytes for every shape: the halo2 extended-domain evaluations are gone
 entirely.
 
+These numbers are steady state (run `bench_prove` with reps ≥ 3 and read the
+later reps). The first rep of a fresh process additionally pays two one-time
+per-adapter costs that later reps amortize away: prove-side, deriving and
+caching the adapter commitments (one O(weights) MSM pass); verify-side, the
+one-time adapter-setup verification (Bulletproofs over every committed
+weight -- seconds for large adapters, see the end-to-end footnote below). A
+single-rep run therefore reports a noticeably slower first prove/verify than
+this table.
+
 ## End-to-end Python pipeline (`run_benchmarks.py`, 4 workers)
 
 | shape | invocations | v3 prove wall | v4 prove wall | speedup | v3 verify wall | v4 verify wall |

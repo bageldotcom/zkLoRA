@@ -360,7 +360,7 @@ For detailed information about the codebase organization and implementation deta
 <td>✓</td><td><strong>Benchmark Required:</strong> Real-shape proving and verification performance should be measured for each deployment target (see <code>benchmarks/run_benchmarks.py</code>, <code>benchmarks/sigma_v4_results.md</code>, and <code>cargo run --release --example bench_prove</code>)</td>
 </tr>
 <tr>
-<td>✓</td><td><strong>Fast Backend (v4):</strong> Pedersen-committed adapters with one-time exact weight range proofs, Fiat-Shamir random-projection sigma protocols for the quantized LoRA relation, and a zero-knowledge sumcheck LogUp range engine deliver 300-1100× faster proving than v3 on previously-feasible shapes and make all real LoRA shapes feasible, with the same statement semantics, the same discrete-log assumption class, and improved (salted, perfectly hiding) adapter commitments</td>
+<td>✓</td><td><strong>Fast Backend (v4):</strong> Pedersen-committed adapters with one-time exact weight range proofs, Fiat-Shamir random-projection sigma protocols for the quantized LoRA relation, and a zero-knowledge sumcheck LogUp range engine deliver 300-1100× faster proving than v3 on previously-feasible shapes and make all real LoRA shapes feasible, with the same statement semantics, the same discrete-log assumption class, and improved (salted, computationally hiding while the contributor's salt stays secret) adapter commitments</td>
 </tr>
 </table>
 
