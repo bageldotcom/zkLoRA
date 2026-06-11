@@ -5,6 +5,7 @@ import importlib
 import json
 import os
 import re
+import secrets
 import threading
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_HALF_UP
@@ -12,13 +13,25 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-# v3: lookup-based range checks in the native circuit (same statement format,
-# same adapter commitment scheme; proofs/vk are not compatible with v2).
-BACKEND_ID = "zklora-halo2-v3"
-SCHEMA_VERSION = 2
+# v4: commit-and-prove sigma backend over ristretto255. The adapter is bound
+# once per manifest through salted Pedersen row commitments plus a one-time
+# exact weight range proof; each invocation proof checks the same exact
+# quantized LoRA relation as the v3 circuit through Fiat-Shamir random
+# projections and aggregated range proofs, so per-proof work no longer scales
+# with rank*in + out*rank weights. Statement semantics, transcript binding,
+# and the verifier trust boundary are unchanged. v3 halo2 artifacts (schema
+# version 2) remain verifiable through the legacy path below.
+BACKEND_ID = "zklora-sigma-v4"
+SCHEMA_VERSION = 3
+PROOF_KIND = "native-sigma-v4"
 COMMITMENT_SCHEME = "sha256-canonical-lora-matrices-v1"
-ADAPTER_COMMITMENT_SCHEME = "poseidon-pasta-fp-adapter-v1"
+ADAPTER_COMMITMENT_SCHEME = "pedersen-ristretto255-salted-v1"
 INVOCATION_STRATEGY = "one-proof-per-module-invocation-v1"
+
+LEGACY_BACKEND_ID = "zklora-halo2-v3"
+LEGACY_SCHEMA_VERSION = 2
+LEGACY_PROOF_KIND = "native-halo2"
+LEGACY_ADAPTER_COMMITMENT_SCHEME = "poseidon-pasta-fp-adapter-v1"
 
 
 class ProofContractError(ValueError):
@@ -365,9 +378,54 @@ _ADAPTER_COMMITMENT_CACHE: dict[tuple, str] = {}
 _ADAPTER_COMMITMENT_CACHE_MAX = 64
 _ADAPTER_COMMITMENT_LOCK = threading.Lock()
 
+_ADAPTER_SALT_LOCK = threading.Lock()
+_ADAPTER_SALT: str | None = None
+
+
+def adapter_salt() -> str:
+    """Secret salt for the contributor's adapter commitments (64 hex chars).
+
+    The salt only affects hiding, never binding: commitments stay binding
+    under discrete log even if the salt leaks, and the salted commitment is
+    strictly more hiding than an unsalted one. It must stay stable across
+    manifest writing and proving so the pinned commitment matches the proofs;
+    set ZKLORA_ADAPTER_SALT_FILE to persist it across processes (LoRAServer
+    defaults this to a file in its output directory). The salt is contributor
+    secret material: it never appears in manifests or proof artifacts.
+    """
+    global _ADAPTER_SALT
+    with _ADAPTER_SALT_LOCK:
+        if _ADAPTER_SALT is None:
+            path = os.environ.get("ZKLORA_ADAPTER_SALT_FILE")
+            if path and os.path.exists(path):
+                value = Path(path).read_text(encoding="utf-8").strip()
+                if len(value) != 64 or any(
+                    c not in "0123456789abcdefABCDEF" for c in value
+                ):
+                    raise ProofContractError(
+                        f"adapter salt file {path} must hold 64 hex characters"
+                    )
+                _ADAPTER_SALT = value.lower()
+            else:
+                _ADAPTER_SALT = secrets.token_hex(32)
+                if path:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(_ADAPTER_SALT + "\n")
+        return _ADAPTER_SALT
+
 
 def _freeze_matrix(matrix: list[list[int]]) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(int(v) for v in row) for row in matrix)
+
+
+def _require_native():
+    native = _native_module()
+    if native is None:
+        raise ProofContractError(
+            "native zkLoRA prover is unavailable; build/install zklora with maturin"
+        )
+    return native
 
 
 def adapter_commitment(
@@ -379,15 +437,13 @@ def adapter_commitment(
 ) -> str:
     # The commitment is recomputed for every invocation statement of a module,
     # over the same (large) adapter matrices. Content-keyed memoisation keeps
-    # the Poseidon chain to one evaluation per adapter. The backend identity is
-    # part of the key so monkeypatched/fake backends never share entries.
-    native = _native_module()
-    if native is None:
-        raise ProofContractError(
-            "native Halo2 prover is unavailable; build/install zklora with maturin"
-        )
+    # the commitment derivation to one pass per adapter. The backend identity
+    # is part of the key so monkeypatched/fake backends never share entries.
+    native = _require_native()
+    salt = adapter_salt()
     key = (
         id(native),
+        salt,
         _freeze_matrix(a),
         _freeze_matrix(b),
         int(scaling_num),
@@ -399,10 +455,11 @@ def adapter_commitment(
     if cached is not None:
         return cached
     value = str(
-        native.adapter_commitment(
+        native.adapter_commitment_v4(
             canonical_json(
                 adapter_commitment_payload(a, b, scaling_num, scaling_den, fixed_point)
-            )
+            ),
+            salt,
         )
     )
     with _ADAPTER_COMMITMENT_LOCK:
@@ -412,14 +469,37 @@ def adapter_commitment(
     return value
 
 
+def adapter_setup(
+    a: list[list[int]],
+    b: list[list[int]],
+    scaling_num: int,
+    scaling_den: int,
+    fixed_point: FixedPointConfig,
+) -> dict[str, Any]:
+    """Public adapter setup for the verifier: salted Pedersen row commitments
+    plus the one-time proofs that every committed weight lies in the exact
+    value-bound interval. Ships inside the pinned adapter manifest; contains
+    no weight or salt material."""
+    native = _require_native()
+    return json.loads(
+        native.adapter_setup_v4(
+            canonical_json(
+                adapter_commitment_payload(a, b, scaling_num, scaling_den, fixed_point)
+            ),
+            adapter_salt(),
+        )
+    )
+
+
 def circuit_id(
     in_dim: int,
     rank: int,
     out_dim: int,
     fixed_point: FixedPointConfig,
+    backend: str = BACKEND_ID,
 ) -> str:
     payload = {
-        "backend": BACKEND_ID,
+        "backend": backend,
         "commitment_scheme": COMMITMENT_SCHEME,
         "invocation_strategy": INVOCATION_STRATEGY,
         "in_dim": in_dim,
@@ -430,8 +510,8 @@ def circuit_id(
     return digest_hex(payload)
 
 
-def vk_fingerprint(circuit: str) -> str:
-    return digest_hex({"backend": BACKEND_ID, "vk_for_circuit": circuit})
+def vk_fingerprint(circuit: str, backend: str = BACKEND_ID) -> str:
+    return digest_hex({"backend": backend, "vk_for_circuit": circuit})
 
 
 def statement_from_witness(witness: InvocationWitness) -> dict[str, Any]:
@@ -580,15 +660,11 @@ def write_invocation_artifacts(
     statement_path = Path(f"{prefix}.zklora.statement.json")
     meta_path = Path(f"{prefix}.zklora.meta.json")
 
-    native = _native_module()
-    if native is None:
-        raise ProofContractError(
-            "native Halo2 prover is unavailable; build/install zklora with maturin"
-        )
-    proof_bytes = native.prove(
-        _native_statement_json(statement), _native_witness_json(witness)
+    native = _require_native()
+    proof_bytes = native.prove_v4(
+        _native_statement_json(statement), _native_witness_json(witness), adapter_salt()
     )
-    proof_kind = "native-halo2"
+    proof_kind = PROOF_KIND
     vk = {
         "schema_version": SCHEMA_VERSION,
         "backend": BACKEND_ID,
@@ -702,6 +778,12 @@ def adapter_manifest_entry(
                 a, b, int(scaling_num), int(scaling_den), fixed_point
             ),
         },
+        # Public verification material: row commitments plus the one-time
+        # weight range/link proofs. The commitment value above is the SHA-256
+        # of the deterministic core, so pinning the manifest pins the setup.
+        "adapter_setup": adapter_setup(
+            a, b, int(scaling_num), int(scaling_den), fixed_point
+        ),
     }
 
 
@@ -764,9 +846,20 @@ def verify_artifact_set(
 ) -> None:
     statement = load_json(statement_path)
     if (
-        statement.get("schema_version") != SCHEMA_VERSION
-        or statement.get("backend") != BACKEND_ID
+        statement.get("schema_version") == LEGACY_SCHEMA_VERSION
+        and statement.get("backend") == LEGACY_BACKEND_ID
     ):
+        backend = LEGACY_BACKEND_ID
+        proof_kind = LEGACY_PROOF_KIND
+        adapter_scheme = LEGACY_ADAPTER_COMMITMENT_SCHEME
+    elif (
+        statement.get("schema_version") == SCHEMA_VERSION
+        and statement.get("backend") == BACKEND_ID
+    ):
+        backend = BACKEND_ID
+        proof_kind = PROOF_KIND
+        adapter_scheme = ADAPTER_COMMITMENT_SCHEME
+    else:
         raise ProofContractError("unsupported proof artifact schema/backend")
     if statement.get("statement_digest") != digest_hex(
         _statement_digest_payload(statement)
@@ -809,19 +902,23 @@ def verify_artifact_set(
         int(statement["adapter_metadata"].get("rank", 0)),
         len(statement["delta"]),
         FixedPointConfig(**statement["fixed_point"]),
+        backend=backend,
     )
     if statement["circuit_id"] != expected_circuit:
         raise ProofContractError("statement circuit_id does not match expected circuit")
-    if statement["vk_fingerprint"] != vk_fingerprint(expected_circuit):
+    if statement["vk_fingerprint"] != vk_fingerprint(expected_circuit, backend=backend):
         raise ProofContractError(
             "statement vk_fingerprint does not match expected circuit"
         )
     adapter = statement.get("adapter_commitment", {})
-    if adapter.get("scheme") != ADAPTER_COMMITMENT_SCHEME:
+    if adapter.get("scheme") != adapter_scheme:
         raise ProofContractError("statement adapter commitment scheme mismatch")
 
     vk = load_json(vk_path)
-    if vk.get("schema_version") != SCHEMA_VERSION or vk.get("backend") != BACKEND_ID:
+    if (
+        vk.get("schema_version") != statement["schema_version"]
+        or vk.get("backend") != backend
+    ):
         raise ProofContractError("unsupported verification key schema/backend")
     if vk.get("circuit_id") != expected_circuit:
         raise ProofContractError("verification key circuit_id mismatch")
@@ -831,17 +928,32 @@ def verify_artifact_set(
     meta = load_json(meta_path)
     proof_bytes = proof_path.read_bytes()
     if (
-        meta.get("schema_version") != SCHEMA_VERSION
-        or meta.get("backend") != BACKEND_ID
+        meta.get("schema_version") != statement["schema_version"]
+        or meta.get("backend") != backend
     ):
         raise ProofContractError("unsupported metadata schema/backend")
-    if meta.get("proof_kind") != "native-halo2":
-        raise ProofContractError("unsupported proof kind; expected native-halo2")
+    if meta.get("proof_kind") != proof_kind:
+        raise ProofContractError(f"unsupported proof kind; expected {proof_kind}")
     native = _native_module()
     if native is None:
-        raise ProofContractError("native Halo2 verifier is unavailable")
-    if not native.verify(_native_statement_json(statement), proof_bytes):
-        raise ProofContractError("proof bytes failed native Halo2 verification")
+        raise ProofContractError("native zkLoRA verifier is unavailable")
+    if backend == BACKEND_ID:
+        setup = expected_adapter.get("adapter_setup")
+        if not isinstance(setup, dict):
+            raise ProofContractError(
+                "expected adapter manifest entry lacks adapter_setup for sigma-v4"
+            )
+        # verify_v4 checks that SHA-256 of the setup core equals the
+        # statement's pinned adapter commitment, verifies the one-time
+        # weight range/link proofs (cached per adapter), and verifies the
+        # invocation proof against the row commitments.
+        if not native.verify_v4(
+            _native_statement_json(statement), proof_bytes, canonical_json(setup)
+        ):
+            raise ProofContractError("proof bytes failed native sigma-v4 verification")
+    else:
+        if not native.verify(_native_statement_json(statement), proof_bytes):
+            raise ProofContractError("proof bytes failed native Halo2 verification")
 
     if meta.get("statement_digest") != statement["statement_digest"]:
         raise ProofContractError("metadata statement digest mismatch")
