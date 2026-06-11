@@ -42,8 +42,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::sigma::{
-    absorb_points, blinding_table, compress, decompress, g_basis, par_msm, pc_gens,
-    random_scalar, transcript_scalar, transcript_scalars, RangeEntry,
+    absorb_points, blinding_table, compress, decompress, g_basis, par_msm, pc_gens, random_scalar,
+    transcript_scalar, transcript_scalars, RangeEntry,
 };
 use crate::NativeError;
 
@@ -187,18 +187,15 @@ fn sumcheck_prove(
             local
         };
         let evals = if half >= 2048 {
-            (0..half)
-                .into_par_iter()
-                .map(eval_pair)
-                .reduce(
-                    || [Scalar::zero(); 4],
-                    |mut acc, local| {
-                        for (a, l) in acc.iter_mut().zip(local.iter()) {
-                            *a += l;
-                        }
-                        acc
-                    },
-                )
+            (0..half).into_par_iter().map(eval_pair).reduce(
+                || [Scalar::zero(); 4],
+                |mut acc, local| {
+                    for (a, l) in acc.iter_mut().zip(local.iter()) {
+                        *a += l;
+                    }
+                    acc
+                },
+            )
         } else {
             let mut acc = [Scalar::zero(); 4];
             for index in 0..half {
@@ -216,9 +213,8 @@ fn sumcheck_prove(
             random_scalar(),
             random_scalar(),
         ];
-        let commitments: [[u8; 32]; 4] = std::array::from_fn(|k| {
-            compress(&scalar_commit(&coeffs[k], &blindings[k]))
-        });
+        let commitments: [[u8; 32]; 4] =
+            std::array::from_fn(|k| compress(&scalar_commit(&coeffs[k], &blindings[k])));
         for commitment in &commitments {
             transcript.append_message(label, commitment);
         }
@@ -373,8 +369,7 @@ fn constraints_eval(w: &LinearWitness, p: &PublicData) -> Vec<Scalar> {
     out.push(inner(&p.weights, &w.d) - w.v);
     // sumcheck B round consistency: g_j(0) + g_j(1) == claim_j
     for (j, coeffs) in w.cb.iter().enumerate() {
-        let round_sum =
-            coeffs[0] + coeffs[0] + coeffs[1] + coeffs[2] + coeffs[3];
+        let round_sum = coeffs[0] + coeffs[0] + coeffs[1] + coeffs[2] + coeffs[3];
         let claim = if j == 0 {
             Scalar::zero()
         } else {
@@ -390,8 +385,7 @@ fn constraints_eval(w: &LinearWitness, p: &PublicData) -> Vec<Scalar> {
     out.push(last_b - p.eqv_b * (p.alpha * w.eh - w.z));
     // sumcheck C round consistency
     for (j, coeffs) in w.cc.iter().enumerate() {
-        let round_sum =
-            coeffs[0] + coeffs[0] + coeffs[1] + coeffs[2] + coeffs[3];
+        let round_sum = coeffs[0] + coeffs[0] + coeffs[1] + coeffs[2] + coeffs[3];
         let claim = if j == 0 {
             Scalar::zero()
         } else {
@@ -430,7 +424,9 @@ impl LinearWitness {
     fn random_like(&self, real_len: usize) -> Self {
         let rand_vec = |len: usize| (0..len).map(|_| random_scalar()).collect::<Vec<_>>();
         let rand_vec_real = |len: usize| {
-            let mut v = (0..real_len.min(len)).map(|_| random_scalar()).collect::<Vec<_>>();
+            let mut v = (0..real_len.min(len))
+                .map(|_| random_scalar())
+                .collect::<Vec<_>>();
             v.resize(len, Scalar::zero());
             v
         };
@@ -519,10 +515,7 @@ fn digit_layout(entries: &[RangeEntry]) -> Result<DigitLayout, NativeError> {
     })
 }
 
-fn recomposition_weights(
-    layout: &DigitLayout,
-    rho: &[Scalar],
-) -> Vec<Scalar> {
+fn recomposition_weights(layout: &DigitLayout, rho: &[Scalar]) -> Vec<Scalar> {
     let mut weights = vec![Scalar::zero(); layout.padded_len];
     for (slot, (entry_index, digit)) in layout.positions.iter().enumerate() {
         weights[slot] = rho[*entry_index] * Scalar::from(1u64 << (TABLE_BITS * digit));
@@ -600,10 +593,7 @@ pub(crate) fn prove(
         .collect();
     let b_h = random_scalar();
     let b_g = random_scalar();
-    let (c_h, c_g) = rayon::join(
-        || vector_commit(&h, &b_h),
-        || vector_commit(&g, &b_g),
-    );
+    let (c_h, c_g) = rayon::join(|| vector_commit(&h, &b_h), || vector_commit(&g, &b_g));
     transcript.append_message(b"logup-c-h", &compress(&c_h));
     transcript.append_message(b"logup-c-g", &compress(&c_g));
 
@@ -1010,30 +1000,61 @@ pub(crate) fn verify(
     let c = transcript_scalar(transcript, b"logup-schnorr-challenge");
 
     // Commitment-equation checks.
-    let check_vector = |sigma: &[Scalar],
-                        sigma_b: &Scalar,
-                        announcement: &[u8; 32],
-                        commitment: &[u8; 32]|
-     -> Result<bool, NativeError> {
-        Ok(vector_commit(sigma, sigma_b)
-            == decompress(announcement)? + decompress(commitment)? * c)
-    };
-    type VectorCheck<'a> = (&'a [Scalar], &'a Scalar, &'a [u8; 32], &'a [u8; 32], &'a str);
+    let check_vector =
+        |sigma: &[Scalar],
+         sigma_b: &Scalar,
+         announcement: &[u8; 32],
+         commitment: &[u8; 32]|
+         -> Result<bool, NativeError> {
+            Ok(vector_commit(sigma, sigma_b)
+                == decompress(announcement)? + decompress(commitment)? * c)
+        };
+    type VectorCheck<'a> = (
+        &'a [Scalar],
+        &'a Scalar,
+        &'a [u8; 32],
+        &'a [u8; 32],
+        &'a str,
+    );
     let vector_checks: [VectorCheck; 4] = [
-        (&schnorr.sigma_d, &schnorr.sigma_bd, &schnorr.r_d, &proof.c_d, "d opening"),
-        (&schnorr.sigma_m, &schnorr.sigma_bm, &schnorr.r_m, &proof.c_m, "m opening"),
-        (&schnorr.sigma_h, &schnorr.sigma_bh, &schnorr.r_h, &proof.c_h, "h opening"),
-        (&schnorr.sigma_g, &schnorr.sigma_bg, &schnorr.r_g, &proof.c_g, "g opening"),
+        (
+            &schnorr.sigma_d,
+            &schnorr.sigma_bd,
+            &schnorr.r_d,
+            &proof.c_d,
+            "d opening",
+        ),
+        (
+            &schnorr.sigma_m,
+            &schnorr.sigma_bm,
+            &schnorr.r_m,
+            &proof.c_m,
+            "m opening",
+        ),
+        (
+            &schnorr.sigma_h,
+            &schnorr.sigma_bh,
+            &schnorr.r_h,
+            &proof.c_h,
+            "h opening",
+        ),
+        (
+            &schnorr.sigma_g,
+            &schnorr.sigma_bg,
+            &schnorr.r_g,
+            &proof.c_g,
+            "g opening",
+        ),
     ];
-    vector_checks
-        .into_par_iter()
-        .try_for_each(|(sigma, sigma_b, announcement, commitment, what)| {
+    vector_checks.into_par_iter().try_for_each(
+        |(sigma, sigma_b, announcement, commitment, what)| {
             if check_vector(sigma, sigma_b, announcement, commitment)? {
                 Ok(())
             } else {
                 Err(fail(what))
             }
-        })?;
+        },
+    )?;
     // V opens P_v = sum rho_e C_e.
     let p_v = RistrettoPoint::vartime_multiscalar_mul(
         rho.iter(),
@@ -1179,10 +1200,7 @@ mod tests {
             n: 8,
             value: 0,
             blinding: Scalar::zero(),
-            commitment: compress(&scalar_commit(
-                &Scalar::from(300u64),
-                &entries[0].blinding,
-            )),
+            commitment: compress(&scalar_commit(&Scalar::from(300u64), &entries[0].blinding)),
         };
         let mut verifier_transcript = Transcript::new(b"logup-test");
         assert!(verify(&mut verifier_transcript, &tampered, &proof).is_err());

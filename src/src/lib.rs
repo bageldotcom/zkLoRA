@@ -2029,7 +2029,13 @@ fn prove_v4(
     witness_json: &str,
     salt_hex: &str,
 ) -> pyo3::PyResult<Vec<u8>> {
-    py.detach(|| Ok(sigma::prove_v4_bytes(statement_json, witness_json, salt_hex)?))
+    py.detach(|| {
+        Ok(sigma::prove_v4_bytes(
+            statement_json,
+            witness_json,
+            salt_hex,
+        )?)
+    })
 }
 
 #[cfg(feature = "python")]
@@ -2185,8 +2191,7 @@ pub mod bench_support {
         (prove_ms, verify_ms, proof.len())
     }
 
-    pub const BENCH_SALT: &str =
-        "5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed";
+    pub const BENCH_SALT: &str = "5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed";
 
     /// Same deterministic statement/witness as the halo2 bench, but with the
     /// adapter commitment string of the sigma-v4 backend. Returns
@@ -2196,12 +2201,10 @@ pub mod bench_support {
         rank: usize,
         out_dim: usize,
     ) -> (String, String, String) {
-        let (statement_json, witness_json, _k) =
-            bench_statement_and_witness(in_dim, rank, out_dim);
+        let (statement_json, witness_json, _k) = bench_statement_and_witness(in_dim, rank, out_dim);
         let mut statement: NativeStatement =
             serde_json::from_str(&statement_json).expect("statement json");
-        let witness: NativeWitness =
-            serde_json::from_str(&witness_json).expect("witness json");
+        let witness: NativeWitness = serde_json::from_str(&witness_json).expect("witness json");
         let adapter_input = AdapterCommitmentInput {
             schema_version: sigma::SIGMA_SCHEMA_VERSION,
             in_dim,
