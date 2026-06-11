@@ -725,6 +725,9 @@ pub struct AdapterSetupPub {
 
 struct AdapterSecrets {
     core: AdapterCore,
+    /// Precomputed adapter commitment string (SHA-256 over the serialized
+    /// core); serializing multi-MB cores on every prove call is measurable.
+    commitment: String,
     row_blindings_a: Vec<Scalar>,
     row_blindings_b: Vec<Scalar>,
     weight_blindings: Vec<Scalar>,
@@ -906,20 +909,22 @@ fn adapter_secrets(
         })
         .collect();
 
+    let core = AdapterCore {
+        scheme: SIGMA_SCHEME_ID.to_string(),
+        schema_version: SIGMA_SCHEMA_VERSION,
+        in_dim,
+        rank,
+        out_dim,
+        fixed_point: input.fixed_point.clone(),
+        scaling_num: input.scaling_num,
+        scaling_den: input.scaling_den,
+        row_commitments_a,
+        row_commitments_b,
+        weight_commitments,
+    };
     Ok(AdapterSecrets {
-        core: AdapterCore {
-            scheme: SIGMA_SCHEME_ID.to_string(),
-            schema_version: SIGMA_SCHEMA_VERSION,
-            in_dim,
-            rank,
-            out_dim,
-            fixed_point: input.fixed_point.clone(),
-            scaling_num: input.scaling_num,
-            scaling_den: input.scaling_den,
-            row_commitments_a,
-            row_commitments_b,
-            weight_commitments,
-        },
+        commitment: adapter_commitment_string(&core),
+        core,
         row_blindings_a,
         row_blindings_b,
         weight_blindings,
@@ -1481,7 +1486,7 @@ pub fn prove_invocation(
         b: witness.b.clone(),
     };
     let secrets = cached_adapter_secrets(&input, salt)?;
-    if adapter_commitment_string(&secrets.core) != ctx.statement.adapter_commitment {
+    if secrets.commitment != ctx.statement.adapter_commitment {
         return Err(NativeError::InvalidDimensions(
             "witness does not match statement adapter commitment".into(),
         ));
@@ -1823,7 +1828,17 @@ pub fn verify_invocation(
     proof_bytes: &[u8],
     setup: &AdapterSetupPub,
 ) -> Result<bool, NativeError> {
-    match verify_invocation_inner(statement_json, proof_bytes, setup) {
+    let commitment = adapter_commitment_string(&setup.core);
+    verify_invocation_cached(statement_json, proof_bytes, setup, &commitment)
+}
+
+fn verify_invocation_cached(
+    statement_json: &str,
+    proof_bytes: &[u8],
+    setup: &AdapterSetupPub,
+    commitment: &str,
+) -> Result<bool, NativeError> {
+    match verify_invocation_inner(statement_json, proof_bytes, setup, commitment) {
         Ok(()) => Ok(true),
         Err(NativeError::Halo2(_)) => Ok(false),
         Err(NativeError::InvalidDimensions(_)) => Ok(false),
@@ -1835,10 +1850,11 @@ fn verify_invocation_inner(
     statement_json: &str,
     proof_bytes: &[u8],
     setup: &AdapterSetupPub,
+    commitment: &str,
 ) -> Result<(), NativeError> {
     let ctx = statement_context(statement_json)?;
     let core = &setup.core;
-    if adapter_commitment_string(core) != ctx.statement.adapter_commitment {
+    if commitment != ctx.statement.adapter_commitment {
         return Err(NativeError::InvalidDimensions(
             "statement adapter commitment does not match setup".into(),
         ));
@@ -2166,7 +2182,7 @@ pub fn adapter_commitment_v4_string(
         serde_json::from_str(adapter_json).map_err(|e| NativeError::Json(e.to_string()))?;
     let salt = parse_salt(salt_hex)?;
     let secrets = cached_adapter_secrets(&input, &salt)?;
-    Ok(adapter_commitment_string(&secrets.core))
+    Ok(secrets.commitment.clone())
 }
 
 pub fn verify_adapter_setup_json(setup_json: &str) -> Result<bool, NativeError> {
@@ -2193,9 +2209,30 @@ pub fn verify_v4_bytes(
     proof: &[u8],
     setup_json: &str,
 ) -> Result<bool, NativeError> {
-    let setup: AdapterSetupPub =
-        serde_json::from_str(setup_json).map_err(|e| NativeError::Json(e.to_string()))?;
-    verify_invocation(statement_json, proof, &setup)
+    // Batch verification passes the same multi-MB setup JSON for every
+    // artifact of a module; cache the parsed setup (and its commitment
+    // string) by content hash. The hash covers the full JSON, so a
+    // different setup can never alias a cache entry.
+    static CACHE: OnceLock<Mutex<BoundedCache<[u8; 32], (AdapterSetupPub, String)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BoundedCache::new(16)));
+    let key = *blake3::hash(setup_json.as_bytes()).as_bytes();
+    let cached = {
+        let mut guard = cache.lock().expect("setup cache poisoned");
+        guard.peek(&key)
+    };
+    let entry = match cached {
+        Some(entry) => entry,
+        None => {
+            let setup: AdapterSetupPub =
+                serde_json::from_str(setup_json).map_err(|e| NativeError::Json(e.to_string()))?;
+            let commitment = adapter_commitment_string(&setup.core);
+            let mut guard = cache.lock().expect("setup cache poisoned");
+            guard.get_or_create(&key, || Ok::<_, NativeError>((setup, commitment)))?
+        }
+    };
+    let (setup, commitment) = entry.as_ref();
+    verify_invocation_cached(statement_json, proof, setup, commitment)
 }
 
 #[cfg(test)]
