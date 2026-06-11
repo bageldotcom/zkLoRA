@@ -379,40 +379,85 @@ _ADAPTER_COMMITMENT_CACHE_MAX = 64
 _ADAPTER_COMMITMENT_LOCK = threading.Lock()
 
 _ADAPTER_SALT_LOCK = threading.Lock()
-_ADAPTER_SALT: str | None = None
+# Salts keyed by resolved salt-file path (None = process-ephemeral). Keying
+# by path instead of a single process global means a changed
+# ZKLORA_ADAPTER_SALT_FILE takes effect at the next call rather than being
+# silently shadowed by whichever caller touched the salt first.
+_ADAPTER_SALTS: dict[str | None, str] = {}
+
+
+def _validate_salt(value: str, origin: str) -> str:
+    if len(value) != 64 or any(c not in "0123456789abcdefABCDEF" for c in value):
+        raise ProofContractError(
+            f"adapter salt from {origin} must be 64 hex characters"
+        )
+    return value.lower()
 
 
 def adapter_salt() -> str:
     """Secret salt for the contributor's adapter commitments (64 hex chars).
 
     The salt only affects hiding, never binding: commitments stay binding
-    under discrete log even if the salt leaks, and the salted commitment is
-    strictly more hiding than an unsalted one. It must stay stable across
-    manifest writing and proving so the pinned commitment matches the proofs;
-    set ZKLORA_ADAPTER_SALT_FILE to persist it across processes (LoRAServer
-    defaults this to a file in its output directory). The salt is contributor
-    secret material: it never appears in manifests or proof artifacts.
+    under discrete log even if the salt leaks, and per-adapter blinding keys
+    are derived from the salt together with the full adapter content, so two
+    adapters never share blindings even under one salt. It must stay stable
+    across manifest writing and proving so the pinned commitment matches the
+    proofs; set ZKLORA_ADAPTER_SALT_FILE to persist it across processes
+    (LoRAServer defaults this to a file in its output directory). The salt
+    is contributor secret material: it never appears in manifests or proof
+    artifacts.
     """
-    global _ADAPTER_SALT
+    path = os.environ.get("ZKLORA_ADAPTER_SALT_FILE") or None
+    key = str(Path(path).resolve()) if path else None
     with _ADAPTER_SALT_LOCK:
-        if _ADAPTER_SALT is None:
-            path = os.environ.get("ZKLORA_ADAPTER_SALT_FILE")
-            if path and os.path.exists(path):
+        cached = _ADAPTER_SALTS.get(key)
+        if cached is not None:
+            return cached
+        if key is None:
+            value = secrets.token_hex(32)
+        else:
+            value = _read_or_create_salt_file(key)
+        _ADAPTER_SALTS[key] = value
+        return value
+
+
+def _read_or_create_salt_file(path: str) -> str:
+    """Atomically create-or-read the salt file.
+
+    O_CREAT|O_EXCL makes exactly one creator win a cross-process race; losers
+    fall through to reading the winner's file. The winner writes to a
+    same-directory temp file and os.replace()s it into place so a reader can
+    never observe a partial salt.
+    """
+    import time
+
+    for attempt in range(20):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
                 value = Path(path).read_text(encoding="utf-8").strip()
-                if len(value) != 64 or any(
-                    c not in "0123456789abcdefABCDEF" for c in value
-                ):
-                    raise ProofContractError(
-                        f"adapter salt file {path} must hold 64 hex characters"
-                    )
-                _ADAPTER_SALT = value.lower()
-            else:
-                _ADAPTER_SALT = secrets.token_hex(32)
-                if path:
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        f.write(_ADAPTER_SALT + "\n")
-        return _ADAPTER_SALT
+            except OSError as exc:
+                raise ProofContractError(
+                    f"cannot read adapter salt file {path}: {exc}"
+                ) from exc
+            if value:
+                return _validate_salt(value, path)
+            # Lost a race against the creator between its O_EXCL placeholder
+            # and the atomic replace; wait briefly and retry.
+            time.sleep(0.05 * (attempt + 1))
+            continue
+        # We are the creator: write atomically via temp file + replace, then
+        # drop the (empty) placeholder created by O_EXCL.
+        os.close(fd)
+        value = secrets.token_hex(32)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        tmp_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(value + "\n")
+        os.replace(tmp, path)
+        return value
+    raise ProofContractError(f"adapter salt file {path} is empty")
 
 
 def _freeze_matrix(matrix: list[list[int]]) -> tuple[tuple[int, ...], ...]:

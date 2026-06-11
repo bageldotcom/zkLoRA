@@ -40,6 +40,16 @@ def generate_proofs(
         raise ProofContractError(
             "native zkLoRA proof generation requires captured invocation records"
         )
+    # Artifact paths are derived from (session_id, module_name,
+    # invocation_index); duplicate keys would race and silently overwrite
+    # each other's files during concurrent generation, so reject them here
+    # rather than relying on the verifier's coverage check.
+    seen_keys: set[tuple[str, str, int]] = set()
+    for record in record_list:
+        key = (record.session_id, record.module_name, int(record.invocation_index))
+        if key in seen_keys:
+            raise ProofContractError(f"duplicate invocation record for {key}")
+        seen_keys.add(key)
 
     def _generate(record: InvocationWitness) -> None:
         write_invocation_artifacts(output_dir, record)
