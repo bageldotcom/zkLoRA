@@ -51,6 +51,14 @@ class LoRAServer:
         self.out_dir = out_dir
         self.fixed_point = fixed_point or FixedPointConfig()
         os.makedirs(self.out_dir, exist_ok=True)
+        # Persist the adapter commitment salt next to the proof artifacts so
+        # commitments stay stable across server restarts (the pinned manifest
+        # must keep matching future proofs). The salt is contributor-secret;
+        # it never enters manifests or proofs.
+        os.environ.setdefault(
+            "ZKLORA_ADAPTER_SALT_FILE",
+            os.path.join(self.out_dir, "adapter-commitment.salt"),
+        )
 
         # 1) Load model, disable cache => no 'past_key_values'
         base_model = AutoModelForCausalLM.from_pretrained(base_model_name)

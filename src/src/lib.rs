@@ -27,6 +27,8 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub mod sigma;
+
 const ADAPTER_COMMITMENT_DOMAIN: u64 = 0x5a4b4c4f5241; // "ZKLORA"
 const ADAPTER_COMMITMENT_VERSION: u64 = 1;
 // Must match proof_contract.SCHEMA_VERSION; it is hashed into adapter commitments.
@@ -70,14 +72,14 @@ impl CircuitKey {
 
 /// Simple bounded FIFO cache. Proving keys and SRS params at large `k` are
 /// hundreds of MB, so we cap how many distinct shapes stay resident.
-struct BoundedCache<K, V> {
+pub(crate) struct BoundedCache<K, V> {
     map: HashMap<K, Arc<V>>,
     order: VecDeque<K>,
     cap: usize,
 }
 
 impl<K: Clone + std::hash::Hash + Eq, V> BoundedCache<K, V> {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             map: HashMap::new(),
             order: VecDeque::new(),
@@ -85,7 +87,7 @@ impl<K: Clone + std::hash::Hash + Eq, V> BoundedCache<K, V> {
         }
     }
 
-    fn get_or_create<E>(
+    pub(crate) fn get_or_create<E>(
         &mut self,
         key: &K,
         create: impl FnOnce() -> Result<V, E>,
@@ -201,7 +203,7 @@ pub struct NativeWitness {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct AdapterCommitmentInput {
+pub(crate) struct AdapterCommitmentInput {
     pub schema_version: u64,
     pub in_dim: usize,
     pub rank: usize,
@@ -760,8 +762,8 @@ impl LoraCircuit {
             ));
         }
         for (label, values) in [
-            ("x", self.x.iter().copied().collect::<Vec<_>>()),
-            ("delta", self.delta.iter().copied().collect::<Vec<_>>()),
+            ("x", self.x.to_vec()),
+            ("delta", self.delta.to_vec()),
             ("A", self.a.iter().flatten().copied().collect::<Vec<_>>()),
             ("B", self.b.iter().flatten().copied().collect::<Vec<_>>()),
         ] {
@@ -1152,6 +1154,25 @@ fn canonical_remainder_interval(denominator: &BigInt) -> (BigInt, BigInt) {
     let two = BigInt::from(2u8);
     let floor_half = denominator / &two;
     (-&floor_half, (denominator - BigInt::one()) / &two)
+}
+
+/// Canonical remainder interval with NativeError reporting (sigma backend).
+pub(crate) fn canonical_remainder_interval_int(denominator: &BigInt) -> (BigInt, BigInt) {
+    canonical_remainder_interval(denominator)
+}
+
+/// Canonical half-up rounding division with NativeError reporting.
+pub(crate) fn div_round_canonical_int(
+    numerator: &BigInt,
+    denominator: &BigInt,
+) -> Result<BigInt, NativeError> {
+    if denominator <= &BigInt::zero() {
+        return Err(NativeError::InvalidDimensions(
+            "denominator must be positive".into(),
+        ));
+    }
+    let floor_half = denominator / BigInt::from(2u8);
+    Ok((numerator + &floor_half).div_floor(denominator))
 }
 
 fn div_round_to_canonical_interval(
@@ -1950,6 +1971,54 @@ fn merkle_root(py: pyo3::Python<'_>, values: Vec<f64>, nonce: Vec<u8>) -> pyo3::
 }
 
 #[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn adapter_setup_v4(
+    py: pyo3::Python<'_>,
+    adapter_json: &str,
+    salt_hex: &str,
+) -> pyo3::PyResult<String> {
+    py.detach(|| Ok(sigma::adapter_setup_json(adapter_json, salt_hex)?))
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn adapter_commitment_v4(
+    py: pyo3::Python<'_>,
+    adapter_json: &str,
+    salt_hex: &str,
+) -> pyo3::PyResult<String> {
+    py.detach(|| Ok(sigma::adapter_commitment_v4_string(adapter_json, salt_hex)?))
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn verify_adapter_setup_v4(py: pyo3::Python<'_>, setup_json: &str) -> pyo3::PyResult<bool> {
+    py.detach(|| Ok(sigma::verify_adapter_setup_json(setup_json)?))
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn prove_v4(
+    py: pyo3::Python<'_>,
+    statement_json: &str,
+    witness_json: &str,
+    salt_hex: &str,
+) -> pyo3::PyResult<Vec<u8>> {
+    py.detach(|| Ok(sigma::prove_v4_bytes(statement_json, witness_json, salt_hex)?))
+}
+
+#[cfg(feature = "python")]
+#[pyo3::pyfunction]
+fn verify_v4(
+    py: pyo3::Python<'_>,
+    statement_json: &str,
+    proof: &[u8],
+    setup_json: &str,
+) -> pyo3::PyResult<bool> {
+    py.detach(|| Ok(sigma::verify_v4_bytes(statement_json, proof, setup_json)?))
+}
+
+#[cfg(feature = "python")]
 #[pyo3::pymodule]
 fn _native_prover(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     use pyo3::types::PyModuleMethods;
@@ -1963,6 +2032,11 @@ fn _native_prover(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<
     m.add_function(wrap_pyfunction!(compute_delta_rows, m)?)?;
     m.add_function(wrap_pyfunction!(quantize_rows, m)?)?;
     m.add_function(wrap_pyfunction!(merkle_root, m)?)?;
+    m.add_function(wrap_pyfunction!(adapter_setup_v4, m)?)?;
+    m.add_function(wrap_pyfunction!(adapter_commitment_v4, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_adapter_setup_v4, m)?)?;
+    m.add_function(wrap_pyfunction!(prove_v4, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_v4, m)?)?;
     Ok(())
 }
 
@@ -2082,6 +2156,64 @@ pub mod bench_support {
         let prove_ms = prove_start.elapsed().as_secs_f64() * 1000.0;
         let verify_start = std::time::Instant::now();
         assert!(verify_bytes(statement_json, &proof).expect("verify"));
+        let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
+        (prove_ms, verify_ms, proof.len())
+    }
+
+    pub const BENCH_SALT: &str =
+        "5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed5eed";
+
+    /// Same deterministic statement/witness as the halo2 bench, but with the
+    /// adapter commitment string of the sigma-v4 backend. Returns
+    /// (statement_json, witness_json, adapter_setup_json).
+    pub fn bench_statement_and_witness_v4(
+        in_dim: usize,
+        rank: usize,
+        out_dim: usize,
+    ) -> (String, String, String) {
+        let (statement_json, witness_json, _k) =
+            bench_statement_and_witness(in_dim, rank, out_dim);
+        let mut statement: NativeStatement =
+            serde_json::from_str(&statement_json).expect("statement json");
+        let witness: NativeWitness =
+            serde_json::from_str(&witness_json).expect("witness json");
+        let adapter_input = AdapterCommitmentInput {
+            schema_version: sigma::SIGMA_SCHEMA_VERSION,
+            in_dim,
+            rank,
+            out_dim,
+            fixed_point: statement.fixed_point.clone(),
+            scaling_num: statement.scaling_num,
+            scaling_den: statement.scaling_den,
+            a: witness.a.clone(),
+            b: witness.b.clone(),
+        };
+        let adapter_json = serde_json::to_string(&adapter_input).expect("adapter json");
+        let setup_json =
+            sigma::adapter_setup_json(&adapter_json, BENCH_SALT).expect("adapter setup");
+        statement.adapter_commitment =
+            sigma::adapter_commitment_v4_string(&adapter_json, BENCH_SALT).expect("commitment");
+        (
+            serde_json::to_string(&statement).expect("statement json"),
+            witness_json,
+            setup_json,
+        )
+    }
+
+    pub fn prove_verify_once_v4(
+        statement_json: &str,
+        witness_json: &str,
+        setup_json: &str,
+    ) -> (f64, f64, usize) {
+        let prove_start = std::time::Instant::now();
+        let proof =
+            sigma::prove_v4_bytes(statement_json, witness_json, BENCH_SALT).expect("prove v4");
+        let prove_ms = prove_start.elapsed().as_secs_f64() * 1000.0;
+        let verify_start = std::time::Instant::now();
+        assert!(
+            sigma::verify_v4_bytes(statement_json, &proof, setup_json).expect("verify v4 call"),
+            "v4 proof must verify"
+        );
         let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
         (prove_ms, verify_ms, proof.len())
     }
