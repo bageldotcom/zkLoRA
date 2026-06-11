@@ -22,9 +22,10 @@ fn main() {
     let backend: String = args.get(5).cloned().unwrap_or_else(|| "sigma".to_string());
 
     if backend == "halo2" {
-        let (statement_json, witness_json, k) =
-            bench_statement_and_witness(in_dim, rank, out_dim);
-        println!("backend=halo2 shape in_dim={in_dim} rank={rank} out_dim={out_dim} k={k} reps={reps}");
+        let (statement_json, witness_json, k) = bench_statement_and_witness(in_dim, rank, out_dim);
+        println!(
+            "backend=halo2 shape in_dim={in_dim} rank={rank} out_dim={out_dim} k={k} reps={reps}"
+        );
         for rep in 0..reps {
             let start = Instant::now();
             let (prove_ms, verify_ms, proof_len) =

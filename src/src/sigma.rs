@@ -60,7 +60,9 @@
 use blake3;
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_TABLE;
-use curve25519_dalek_ng::ristretto::{CompressedRistretto, RistrettoBasepointTable, RistrettoPoint};
+use curve25519_dalek_ng::ristretto::{
+    CompressedRistretto, RistrettoBasepointTable, RistrettoPoint,
+};
 use curve25519_dalek_ng::scalar::Scalar;
 use curve25519_dalek_ng::traits::{Identity, MultiscalarMul, VartimeMultiscalarMul};
 use merlin::Transcript;
@@ -248,7 +250,11 @@ pub(crate) fn transcript_scalars(
         .collect()
 }
 
-pub(crate) fn absorb_points(transcript: &mut Transcript, label: &'static [u8], points: &[[u8; 32]]) {
+pub(crate) fn absorb_points(
+    transcript: &mut Transcript,
+    label: &'static [u8],
+    points: &[[u8; 32]],
+) {
     transcript.append_u64(b"count", points.len() as u64);
     for point in points {
         transcript.append_message(label, point);
@@ -363,9 +369,7 @@ impl BoundedClass {
                 let limbs = limbs_of(&shifted, plan.limb_maxes.len());
                 for (limb, max) in limbs.iter().zip(plan.limb_maxes.iter()) {
                     if limb > max {
-                        return Err(NativeError::InvalidDimensions(
-                            "value above range".into(),
-                        ));
+                        return Err(NativeError::InvalidDimensions("value above range".into()));
                     }
                 }
                 let mut commitments = Vec::with_capacity(limbs.len());
@@ -518,10 +522,12 @@ enum RangeBundle {
 /// ZKLORA_RANGE_ENGINE=bulletproofs opts into compact proofs instead.
 fn invocation_range_engine() -> &'static str {
     static ENGINE: OnceLock<String> = OnceLock::new();
-    ENGINE.get_or_init(|| match std::env::var("ZKLORA_RANGE_ENGINE").ok().as_deref() {
-        Some("bulletproofs") => "bulletproofs".to_string(),
-        _ => "logup".to_string(),
-    })
+    ENGINE.get_or_init(
+        || match std::env::var("ZKLORA_RANGE_ENGINE").ok().as_deref() {
+            Some("bulletproofs") => "bulletproofs".to_string(),
+            _ => "logup".to_string(),
+        },
+    )
 }
 
 fn prove_ranges_with_engine(
@@ -755,8 +761,7 @@ fn validate_adapter_input(input: &AdapterCommitmentInput) -> Result<(), NativeEr
             "adapter payload dimensions do not match matrices".into(),
         ));
     }
-    if input.a.iter().any(|row| row.len() != in_dim)
-        || input.b.iter().any(|row| row.len() != rank)
+    if input.a.iter().any(|row| row.len() != in_dim) || input.b.iter().any(|row| row.len() != rank)
     {
         return Err(NativeError::InvalidDimensions(
             "adapter matrices are ragged".into(),
@@ -943,7 +948,9 @@ fn adapter_transcript(core: &AdapterCore) -> Transcript {
     transcript.append_message(b"phase", b"adapter-setup");
     transcript.append_message(
         b"core",
-        serde_json::to_string(core).expect("core serializes").as_bytes(),
+        serde_json::to_string(core)
+            .expect("core serializes")
+            .as_bytes(),
     );
     transcript
 }
@@ -982,7 +989,9 @@ fn prove_link(
     let rho_t = random_scalar();
     let r1 = RistrettoPoint::multiscalar_mul(
         rho.iter().chain(std::iter::once(&rho_s)),
-        basis[..cols].iter().chain(std::iter::once(&gens.B_blinding)),
+        basis[..cols]
+            .iter()
+            .chain(std::iter::once(&gens.B_blinding)),
     );
     let mu_rho: Scalar = mu.iter().zip(rho.iter()).map(|(m, r)| m * r).sum();
     let r2 = &mu_rho * &RISTRETTO_BASEPOINT_TABLE + gens.B_blinding * rho_t;
@@ -1050,10 +1059,14 @@ fn verify_link(
 
     let lhs1 = RistrettoPoint::vartime_multiscalar_mul(
         proof.sigma_z.iter().chain(std::iter::once(&proof.sigma_s)),
-        basis[..cols].iter().chain(std::iter::once(&gens.B_blinding)),
+        basis[..cols]
+            .iter()
+            .chain(std::iter::once(&gens.B_blinding)),
     );
     if lhs1 != decompress(&proof.r1)? + p1 * c {
-        return Err(NativeError::Halo2("adapter link proof (rows) failed".into()));
+        return Err(NativeError::Halo2(
+            "adapter link proof (rows) failed".into(),
+        ));
     }
     let mu_sigma: Scalar = mu
         .iter()
@@ -1358,7 +1371,10 @@ fn invocation_transcript(statement_json: &str, ctx: &StatementContext) -> Transc
     transcript.append_message(b"phase", b"invocation");
     // The canonical statement JSON binds x, delta, dims, config, scaling,
     // the adapter commitment and the upstream statement digest.
-    transcript.append_message(b"statement", blake3::hash(statement_json.as_bytes()).as_bytes());
+    transcript.append_message(
+        b"statement",
+        blake3::hash(statement_json.as_bytes()).as_bytes(),
+    );
     transcript.append_message(b"adapter", ctx.statement.adapter_commitment.as_bytes());
     transcript
 }
@@ -1390,16 +1406,17 @@ fn projected_commitments(
     gamma: &[Scalar],
     beta: &[Scalar],
 ) -> Result<ProjectedCommitments, NativeError> {
-    let combine = |scalars: &[Scalar], commitments: &[[u8; 32]]| -> Result<RistrettoPoint, NativeError> {
-        Ok(RistrettoPoint::vartime_multiscalar_mul(
-            scalars.iter(),
-            commitments
-                .iter()
-                .map(decompress)
-                .collect::<Result<Vec<_>, _>>()?
-                .iter(),
-        ))
-    };
+    let combine =
+        |scalars: &[Scalar], commitments: &[[u8; 32]]| -> Result<RistrettoPoint, NativeError> {
+            Ok(RistrettoPoint::vartime_multiscalar_mul(
+                scalars.iter(),
+                commitments
+                    .iter()
+                    .map(decompress)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter(),
+            ))
+        };
     // One flat MSM per class: sum_j s_j * (sum_i 2^(64 i) C_{j,i} + lower*B)
     // = sum_{j,i} (s_j 2^(64 i)) C_{j,i} + lower*(sum_j s_j)*B.
     let combine_class =
@@ -1536,11 +1553,7 @@ pub fn prove_invocation(
     let (rema_lower, rema_upper) = canonical_remainder_interval_int(scale);
     let rema_width = &rema_upper - &rema_lower;
     let rema = BoundedClass::commit(&rema_values, &rema_lower, &rema_width)?;
-    let u = BoundedClass::commit(
-        &u_values,
-        &-&intermediate_bound,
-        &(&intermediate_bound * 2),
-    )?;
+    let u = BoundedClass::commit(&u_values, &-&intermediate_bound, &(&intermediate_bound * 2))?;
     let remb = BoundedClass::commit(&remb_values, &rema_lower, &rema_width)?;
     let w = if ctx.trivial_scaling {
         None
@@ -1618,16 +1631,15 @@ pub fn prove_invocation(
         .zip(secrets.row_blindings_b.iter())
         .map(|(bj, blind)| bj * blind)
         .sum();
-    let fold =
-        |scalars: &[Scalar], values: &[BigInt], blindings: &[Scalar]| -> (Scalar, Scalar) {
-            let mut value_sum = Scalar::zero();
-            let mut blinding_sum = Scalar::zero();
-            for ((scalar, value), blinding) in scalars.iter().zip(values).zip(blindings) {
-                value_sum += scalar * scalar_from_bigint(value).expect("bounded value");
-                blinding_sum += scalar * blinding;
-            }
-            (value_sum, blinding_sum)
-        };
+    let fold = |scalars: &[Scalar], values: &[BigInt], blindings: &[Scalar]| -> (Scalar, Scalar) {
+        let mut value_sum = Scalar::zero();
+        let mut blinding_sum = Scalar::zero();
+        for ((scalar, value), blinding) in scalars.iter().zip(values).zip(blindings) {
+            value_sum += scalar * scalar_from_bigint(value).expect("bounded value");
+            blinding_sum += scalar * blinding;
+        }
+        (value_sum, blinding_sum)
+    };
     let (s_u, b_su) = fold(&gamma, &u_values, &u.value_blindings);
     let (s_ra, b_sra) = fold(&gamma, &rema_values, &rema.value_blindings);
     let (_s_rb, b_srb) = fold(&beta, &remb_values, &remb.value_blindings);
@@ -1642,7 +1654,12 @@ pub fn prove_invocation(
     let num_scalar = scalar_from_i64(ctx.statement.scaling_num);
 
     // --- linear Schnorr: E1 + zeta*E3 over (a_proj, S_u, S_ra[, S_w, S_rf])
-    let x_scalars: Vec<Scalar> = ctx.statement.x.iter().map(|v| scalar_from_i64(*v)).collect();
+    let x_scalars: Vec<Scalar> = ctx
+        .statement
+        .x
+        .iter()
+        .map(|v| scalar_from_i64(*v))
+        .collect();
     let rho_a: Vec<Scalar> = (0..ctx.in_dim).map(|_| random_scalar()).collect();
     let rho_ba = random_scalar();
     let rho_su = random_scalar();
@@ -1650,13 +1667,26 @@ pub fn prove_invocation(
     let rho_sra = random_scalar();
     let rho_bsra = random_scalar();
     let (rho_sw, rho_bsw, rho_srf, rho_bsrf) = if ctx.trivial_scaling {
-        (Scalar::zero(), Scalar::zero(), Scalar::zero(), Scalar::zero())
+        (
+            Scalar::zero(),
+            Scalar::zero(),
+            Scalar::zero(),
+            Scalar::zero(),
+        )
     } else {
         (
             random_scalar(),
             random_scalar(),
-            if ctx.has_remf { random_scalar() } else { Scalar::zero() },
-            if ctx.has_remf { random_scalar() } else { Scalar::zero() },
+            if ctx.has_remf {
+                random_scalar()
+            } else {
+                Scalar::zero()
+            },
+            if ctx.has_remf {
+                random_scalar()
+            } else {
+                Scalar::zero()
+            },
         )
     };
     let r_pa = RistrettoPoint::multiscalar_mul(
@@ -1902,12 +1932,8 @@ fn verify_invocation_inner(
     let intermediate_bound = intermediate_bound_int(&ctx.statement.fixed_point);
     let (rema_lower, rema_upper) = canonical_remainder_interval_int(scale);
     let rema_width = &rema_upper - &rema_lower;
-    let rema = BoundedClass::from_commitments(
-        proof.c_rema.clone(),
-        ctx.rank,
-        &rema_lower,
-        &rema_width,
-    )?;
+    let rema =
+        BoundedClass::from_commitments(proof.c_rema.clone(), ctx.rank, &rema_lower, &rema_width)?;
     let u = BoundedClass::from_commitments(
         proof.c_u.clone(),
         ctx.rank,
@@ -1990,7 +2016,10 @@ fn verify_invocation_inner(
     let c1 = transcript_scalar(&mut transcript, b"lin-challenge");
 
     let lhs_pa = RistrettoPoint::vartime_multiscalar_mul(
-        linear.sigma_a.iter().chain(std::iter::once(&linear.sigma_ba)),
+        linear
+            .sigma_a
+            .iter()
+            .chain(std::iter::once(&linear.sigma_ba)),
         basis[..ctx.in_dim]
             .iter()
             .chain(std::iter::once(&gens.B_blinding)),
@@ -2005,7 +2034,9 @@ fn verify_invocation_inner(
      -> Result<(), NativeError> {
         let lhs = sigma * &RISTRETTO_BASEPOINT_TABLE + gens.B_blinding * sigma_blind;
         if lhs != decompress(announcement)? + derived * c1 {
-            return Err(NativeError::Halo2("linear proof: scalar check failed".into()));
+            return Err(NativeError::Halo2(
+                "linear proof: scalar check failed".into(),
+            ));
         }
         Ok(())
     };
@@ -2037,7 +2068,12 @@ fn verify_invocation_inner(
     ) {
         check_scalar_commitment(sigma, blind, announcement, derived)?;
     }
-    let x_scalars: Vec<Scalar> = ctx.statement.x.iter().map(|v| scalar_from_i64(*v)).collect();
+    let x_scalars: Vec<Scalar> = ctx
+        .statement
+        .x
+        .iter()
+        .map(|v| scalar_from_i64(*v))
+        .collect();
     let x_sigma: Scalar = x_scalars
         .iter()
         .zip(linear.sigma_a.iter())
@@ -2075,8 +2111,8 @@ fn verify_invocation_inner(
         return Err(NativeError::Halo2("quad proof: P_B check failed".into()));
     }
     for k in 0..ctx.rank {
-        let lhs = &quad.sigma_u[k] * &RISTRETTO_BASEPOINT_TABLE
-            + gens.B_blinding * quad.sigma_bu[k];
+        let lhs =
+            &quad.sigma_u[k] * &RISTRETTO_BASEPOINT_TABLE + gens.B_blinding * quad.sigma_bu[k];
         if lhs != decompress(&quad.r_u[k])? + projected.d_u[k] * c2 {
             return Err(NativeError::Halo2("quad proof: u_k check failed".into()));
         }
@@ -2090,14 +2126,11 @@ fn verify_invocation_inner(
     // <sigma_b, sigma_u> B + omega B~ == C_T0 + c2 C_T1 + c2^2 (s D_Sw + D_Srb)
     // with the public-S_w variant adding c2^2 s S_w B on the right.
     let lhs = &inner * &RISTRETTO_BASEPOINT_TABLE + gens.B_blinding * quad.omega;
-    let mut rhs = decompress(&quad.c_t0)?
-        + decompress(&quad.c_t1)? * c2
-        + projected.d_srb * (c2 * c2);
+    let mut rhs =
+        decompress(&quad.c_t0)? + decompress(&quad.c_t1)? * c2 + projected.d_srb * (c2 * c2);
     match &projected.d_sw {
         Some(d_sw) => rhs += d_sw * (c2 * c2 * scale_scalar),
-        None => {
-            rhs += &(c2 * c2 * scale_scalar * projected.public_sw) * &RISTRETTO_BASEPOINT_TABLE
-        }
+        None => rhs += &(c2 * c2 * scale_scalar * projected.public_sw) * &RISTRETTO_BASEPOINT_TABLE,
     }
     if lhs != rhs {
         return Err(NativeError::Halo2(
@@ -2275,9 +2308,8 @@ mod tests {
         let x: Vec<i64> = (0..in_dim).map(|_| next(magnitude)).collect();
 
         let scale = BigInt::from(1) << scale_bits;
-        let div_round = |n: &BigInt, d: &BigInt| -> BigInt {
-            (n + d / BigInt::from(2u8)).div_floor(d)
-        };
+        let div_round =
+            |n: &BigInt, d: &BigInt| -> BigInt { (n + d / BigInt::from(2u8)).div_floor(d) };
         let u: Vec<BigInt> = a
             .iter()
             .map(|row| {
@@ -2299,8 +2331,7 @@ mod tests {
                     .sum();
                 let w = div_round(&raw, &scale);
                 let scaled = w * BigInt::from(scaling_num);
-                i64::try_from(div_round(&scaled, &BigInt::from(scaling_den)))
-                    .expect("delta fits")
+                i64::try_from(div_round(&scaled, &BigInt::from(scaling_den))).expect("delta fits")
             })
             .collect();
 
