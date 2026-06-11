@@ -60,7 +60,12 @@ class LoRAServer:
         # derived per adapter content) but means a server restarted standalone
         # must keep pointing at the SAME salt file for its pinned manifest to
         # stay valid -- hence the warning instead of silently rebinding.
-        own_salt_file = os.path.join(self.out_dir, "adapter-commitment.salt")
+        # Absolute path: adapter_salt() resolves the env var against the
+        # cwd at call time, so a relative out_dir plus a later chdir would
+        # silently rebind the salt file and break the pinned manifest.
+        own_salt_file = os.path.abspath(
+            os.path.join(self.out_dir, "adapter-commitment.salt")
+        )
         configured = os.environ.setdefault("ZKLORA_ADAPTER_SALT_FILE", own_salt_file)
         if os.path.abspath(configured) != os.path.abspath(own_salt_file):
             print(

@@ -414,6 +414,16 @@ def adapter_salt() -> str:
         if cached is not None:
             return cached
         if key is None:
+            import warnings
+
+            warnings.warn(
+                "ZKLORA_ADAPTER_SALT_FILE is not set; using a "
+                "process-ephemeral adapter salt. Commitments made by this "
+                "process will not match any other process (set the env var "
+                "to a stable file to persist the salt).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             value = secrets.token_hex(32)
         else:
             value = _read_or_create_salt_file(key)
@@ -424,40 +434,53 @@ def adapter_salt() -> str:
 def _read_or_create_salt_file(path: str) -> str:
     """Atomically create-or-read the salt file.
 
-    O_CREAT|O_EXCL makes exactly one creator win a cross-process race; losers
-    fall through to reading the winner's file. The winner writes to a
-    same-directory temp file and os.replace()s it into place so a reader can
-    never observe a partial salt.
+    The salt is written to a same-directory temp file first and hard-linked
+    into place, so the file at `path` either does not exist or holds a
+    complete salt: no crash window can leave a permanently empty salt file
+    (an empty placeholder would poison every future call, since the path
+    would exist but never gain content). Concurrent creators race on the
+    link; exactly one wins and the losers read the winner's salt.
     """
     import time
 
     for attempt in range(20):
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            try:
-                value = Path(path).read_text(encoding="utf-8").strip()
-            except OSError as exc:
-                raise ProofContractError(
-                    f"cannot read adapter salt file {path}: {exc}"
-                ) from exc
+            value = Path(path).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ProofContractError(
+                f"cannot read adapter salt file {path}: {exc}"
+            ) from exc
+        else:
             if value:
                 return _validate_salt(value, path)
-            # Lost a race against the creator between its O_EXCL placeholder
-            # and the atomic replace; wait briefly and retry.
+            # Empty file: a stale placeholder from a crashed pre-link-fix
+            # process, or a concurrent creator still running old code. Retry
+            # briefly, then surface instead of looping forever.
             time.sleep(0.05 * (attempt + 1))
             continue
-        # We are the creator: write atomically via temp file + replace, then
-        # drop the (empty) placeholder created by O_EXCL.
-        os.close(fd)
         value = secrets.token_hex(32)
-        tmp = f"{path}.tmp.{os.getpid()}"
+        tmp = f"{path}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
         tmp_fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            f.write(value + "\n")
-        os.replace(tmp, path)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(value + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                # Lost the race; the winner's file is complete by link time.
+                continue
+        finally:
+            os.unlink(tmp)
         return value
-    raise ProofContractError(f"adapter salt file {path} is empty")
+    raise ProofContractError(
+        f"adapter salt file {path} is empty; delete the stale file to let a "
+        "fresh salt be created (manifests pinned under the lost salt will no "
+        "longer match new proofs)"
+    )
 
 
 def _freeze_matrix(matrix: list[list[int]]) -> tuple[tuple[int, ...], ...]:

@@ -4,8 +4,9 @@ This test reconstructs proof artifacts byte-for-byte the way `main`
 (commit 8b53724, backend `zklora-halo2-v3`, schema_version 2) wrote them --
 poseidon adapter commitment, halo2 proof bytes, legacy circuit/vk
 fingerprints -- and checks that the current verifier accepts them through
-the legacy path while still rejecting tampering. It needs the built native
-extension for the halo2 prover.
+the legacy path while still rejecting tampering. Only the legacy-artifact
+test needs the built native extension; the salt and duplicate-record
+hardening tests are pure Python and run everywhere.
 """
 
 import hashlib
@@ -19,10 +20,15 @@ import pytest
 if os.environ.get("ZKLORA_REQUIRE_NATIVE_EXTENSION") == "1":
     native = importlib.import_module("zklora._native_prover")
 else:
-    native = pytest.importorskip(
-        "zklora._native_prover",
-        reason="native PyO3 extension is not built in this environment",
-    )
+    try:
+        native = importlib.import_module("zklora._native_prover")
+    except ImportError:
+        native = None
+
+requires_native = pytest.mark.skipif(
+    native is None,
+    reason="native PyO3 extension is not built in this environment",
+)
 
 from zklora.proof_contract import (
     COMMITMENT_SCHEME,
@@ -160,6 +166,7 @@ def _write_legacy_artifacts(output_dir, fp):
     return statement, manifest_entry, prefix
 
 
+@requires_native
 def test_legacy_v3_artifacts_still_verify_and_reject_tampering(tmp_path):
     fp = FixedPointConfig(scale_bits=0, value_bits=8, intermediate_bits=16)
     statement, manifest_entry, prefix = _write_legacy_artifacts(tmp_path, fp)
@@ -196,6 +203,25 @@ def test_adapter_salt_is_path_keyed_and_atomic(tmp_path, monkeypatch):
     assert other != persisted
     monkeypatch.setenv("ZKLORA_ADAPTER_SALT_FILE", str(salt_file))
     assert pc.adapter_salt() == persisted
+
+
+def test_adapter_salt_empty_file_is_reported_not_looped(tmp_path, monkeypatch):
+    # A stale empty salt file (e.g. left by a crash) must surface as a clear
+    # bounded error, not poison the path forever; and salt creation itself
+    # must never place an empty file at the path (content is hard-linked in
+    # atomically), so this state can only come from pre-fix code or manual
+    # tampering.
+    import time
+
+    import zklora.proof_contract as pc
+
+    monkeypatch.setattr(pc, "_ADAPTER_SALTS", {})
+    salt_file = tmp_path / "salt-stale"
+    salt_file.write_text("")
+    monkeypatch.setenv("ZKLORA_ADAPTER_SALT_FILE", str(salt_file))
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    with pytest.raises(pc.ProofContractError, match="empty"):
+        pc.adapter_salt()
 
 
 def test_generate_proofs_rejects_duplicate_invocation_keys(tmp_path, monkeypatch):

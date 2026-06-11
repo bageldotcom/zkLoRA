@@ -23,7 +23,9 @@
 //!   gamma/beta), proven with generalized Schnorr proofs plus one rank-sized
 //!   quadratic inner-product sigma protocol. Remainders and quotients are
 //!   range-bounded with aggregated Bulletproofs. Per-proof work is
-//!   O(in + rank + out) group operations -- independent of `rank*in`.
+//!   O(in + rank + out) group operations -- independent of `rank*in` --
+//!   amortized: the first proof for an adapter additionally derives and
+//!   caches the adapter commitments, one O(weights) MSM pass.
 //!
 //! Statement semantics are identical to the v3 circuit: the same canonical
 //! half-up rounding, the same exact remainder intervals, the same value and
@@ -37,8 +39,12 @@
 //! collision resistance of SHA-256/BLAKE3 -- the same assumption class as
 //! the v3 backend (halo2-IPA over Pasta is discrete-log based, and the v3
 //! transcript already used hash-based Fiat-Shamir). Hiding is improved:
-//! Pedersen commitments are perfectly hiding and the adapter commitment is
-//! salted, whereas the v3 Poseidon chain over raw weights was unsalted.
+//! invocation commitments use fresh uniform blindings (perfectly hiding),
+//! while adapter commitments use deterministic blindings derived from the
+//! contributor's secret salt keyed with the adapter content -- so they are
+//! computationally hiding while the salt stays secret, degrading to the
+//! (still binding) unsalted v3 level if it leaks. The v3 Poseidon chain
+//! over raw weights was unsalted to begin with.
 //!
 //! Soundness notes (the chain from accepted proof to exact delta):
 //! 1. All commitments are absorbed into the merlin transcript before any
@@ -72,7 +78,6 @@ use rand_core::OsRng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use crate::{
@@ -1211,15 +1216,18 @@ pub(crate) fn adapter_setup(
 }
 
 /// Verify the one-time adapter setup proofs. Results are cached by the
-/// commitment string, so a batch verification pays this once per adapter.
+/// commitment string (bounded FIFO, oldest-out eviction), so a batch
+/// verification pays this once per adapter and a long-running verifier
+/// never drops every cached result at once.
 pub fn verify_adapter_setup(setup: &AdapterSetupPub) -> Result<(), NativeError> {
     let commitment = adapter_commitment_string(&setup.core);
-    static VERIFIED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let verified = VERIFIED.get_or_init(|| Mutex::new(HashSet::new()));
+    static VERIFIED: OnceLock<Mutex<BoundedCache<String, ()>>> = OnceLock::new();
+    let verified = VERIFIED.get_or_init(|| Mutex::new(BoundedCache::new(1024)));
     if verified
         .lock()
         .expect("verified cache poisoned")
-        .contains(&commitment)
+        .peek(&commitment)
+        .is_some()
     {
         return Ok(());
     }
@@ -1293,11 +1301,10 @@ pub fn verify_adapter_setup(setup: &AdapterSetupPub) -> Result<(), NativeError> 
     class.push_entries(&mut entries)?;
     verify_ranges(&transcript, entries, &setup.ranges)?;
 
-    let mut guard = verified.lock().expect("verified cache poisoned");
-    if guard.len() >= 1024 {
-        guard.clear();
-    }
-    guard.insert(commitment);
+    verified
+        .lock()
+        .expect("verified cache poisoned")
+        .get_or_create(&commitment, || Ok::<_, NativeError>(()))?;
     Ok(())
 }
 
@@ -1969,6 +1976,9 @@ fn verify_invocation_inner(
     // collections from length prefixes, so an attacker-supplied blob could
     // otherwise demand far more memory than its own length. The options
     // mirror `bincode::serialize`'s wire format (fixint, trailing allowed).
+    // A decode failure is a proof-level rejection (attacker-controlled
+    // bytes, verify returns false), not a caller error like malformed
+    // statement JSON -- hence Halo2, which the caller maps to Ok(false).
     let proof: InvocationProof = {
         use bincode::Options;
         bincode::DefaultOptions::new()
@@ -1976,7 +1986,7 @@ fn verify_invocation_inner(
             .allow_trailing_bytes()
             .with_limit(proof_bytes.len().saturating_mul(2) as u64)
             .deserialize(proof_bytes)
-            .map_err(|e| NativeError::Json(e.to_string()))?
+            .map_err(|e| NativeError::Halo2(format!("invocation proof decode: {e}")))?
     };
     if (proof.c_w.is_some() == ctx.trivial_scaling) || (proof.c_remf.is_some() != ctx.has_remf) {
         return Err(NativeError::InvalidDimensions(
@@ -2501,8 +2511,16 @@ mod tests {
         let mut proof = prove_v4_bytes(&statement, &witness, &salt).expect("prove");
         let index = proof.len() / 2;
         proof[index] ^= 0x40;
-        // Either a decode error (treated as false) or a failed check.
-        assert!(!verify_v4_bytes(&statement, &proof, &setup).unwrap_or(false));
+        // Tampering must yield a clean reject (Ok(false)), never an Err:
+        // decode failures and failed checks share the same caller contract.
+        assert!(!verify_v4_bytes(&statement, &proof, &setup).expect("verify call"));
+    }
+
+    #[test]
+    fn garbage_proof_bytes_rejected_cleanly() {
+        let (statement, _witness, setup, _salt) = make_case(3, 1, 2, 1, 1, 8, 24, 56, 67);
+        assert!(!verify_v4_bytes(&statement, b"not a proof", &setup).expect("verify call"));
+        assert!(!verify_v4_bytes(&statement, &[], &setup).expect("verify call"));
     }
 
     #[test]
