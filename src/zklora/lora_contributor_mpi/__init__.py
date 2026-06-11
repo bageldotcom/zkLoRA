@@ -54,11 +54,20 @@ class LoRAServer:
         # Persist the adapter commitment salt next to the proof artifacts so
         # commitments stay stable across server restarts (the pinned manifest
         # must keep matching future proofs). The salt is contributor-secret;
-        # it never enters manifests or proofs.
-        os.environ.setdefault(
-            "ZKLORA_ADAPTER_SALT_FILE",
-            os.path.join(self.out_dir, "adapter-commitment.salt"),
-        )
+        # it never enters manifests or proofs. The env var is process-wide:
+        # when several LoRAServers share one process, they share the first
+        # server's salt file, which is safe for hiding (blinding keys are
+        # derived per adapter content) but means a server restarted standalone
+        # must keep pointing at the SAME salt file for its pinned manifest to
+        # stay valid -- hence the warning instead of silently rebinding.
+        own_salt_file = os.path.join(self.out_dir, "adapter-commitment.salt")
+        configured = os.environ.setdefault("ZKLORA_ADAPTER_SALT_FILE", own_salt_file)
+        if os.path.abspath(configured) != os.path.abspath(own_salt_file):
+            print(
+                f"[A-Server] WARNING: adapter salt file is {configured} (shared), "
+                f"not {own_salt_file}; keep ZKLORA_ADAPTER_SALT_FILE stable across "
+                "restarts or previously pinned manifests will not match new proofs."
+            )
 
         # 1) Load model, disable cache => no 'past_key_values'
         base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
@@ -84,6 +93,10 @@ class LoRAServer:
 
         self.session_data: dict[str, list[InvocationWitness]] = {}
         self._invocation_counts: dict[tuple[str, str], int] = {}
+        # INVARIANT: last_scaling / last_q_delta are single shared snapshot
+        # slots, written by apply_lora and read by the socket layer. They are
+        # only safe because LoRAServerSocket serializes every request under
+        # one _server_lock; any reader added outside that lock would race.
         self.last_scaling: tuple[int, int] = (1, 1)
         self.last_q_delta: list[list[int]] = []
         self._module_cache: dict[str, dict] = {}

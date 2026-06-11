@@ -218,16 +218,41 @@ pub(crate) fn random_scalar() -> Scalar {
     RNG.with(|rng| Scalar::random(&mut *rng.borrow_mut()))
 }
 
-/// Deterministic blinding factors for adapter commitments: keyed BLAKE3 over
-/// the secret salt. The salt never leaves the prover; if it leaks, hiding
-/// degrades to the (still binding) unsalted level of the v3 scheme.
-fn derived_blinding(salt: &[u8; 32], domain: &str, index: u64) -> Scalar {
-    let mut hasher = blake3::Hasher::new_keyed(salt);
+/// Deterministic blinding factors for adapter commitments: keyed BLAKE3
+/// under a key that binds BOTH the contributor's secret salt AND the full
+/// adapter content (see `adapter_blinding_key`). Binding the content is
+/// essential: if blindings depended only on (salt, domain, index), two
+/// same-shaped adapters published by the same contributor would share
+/// blindings at every index, and commitment differences C1_i - C2_i =
+/// (w1_i - w2_i)*G would leak exact weight differences from the public
+/// manifest. The salt never leaves the prover; if it leaks, hiding degrades
+/// to the (still binding) unsalted level of the v3 scheme.
+fn derived_blinding(key: &[u8; 32], domain: &str, index: u64) -> Scalar {
+    let mut hasher = blake3::Hasher::new_keyed(key);
     hasher.update(domain.as_bytes());
     hasher.update(&index.to_le_bytes());
     let mut bytes = [0u8; 64];
     hasher.finalize_xof().fill(&mut bytes);
     Scalar::from_bytes_mod_order_wide(&bytes)
+}
+
+/// Per-adapter blinding key: keyed BLAKE3 of the canonical adapter payload
+/// (dims, config, scaling, and every weight) under the contributor salt.
+/// Distinct adapters therefore get independent blindings even when they
+/// share a shape and a salt, while the derivation stays deterministic so
+/// manifest commitments and proof-time commitments always agree.
+fn adapter_blinding_key(
+    input: &AdapterCommitmentInput,
+    salt: &[u8; 32],
+) -> Result<[u8; 32], NativeError> {
+    let mut hasher = blake3::Hasher::new_keyed(salt);
+    hasher.update(b"zklora-sigma-v4 adapter blinding key");
+    hasher.update(
+        serde_json::to_string(input)
+            .map_err(|e| NativeError::Json(e.to_string()))?
+            .as_bytes(),
+    );
+    Ok(*hasher.finalize().as_bytes())
 }
 
 pub(crate) fn transcript_scalar(transcript: &mut Transcript, label: &'static [u8]) -> Scalar {
@@ -298,14 +323,20 @@ fn min_bp_bits(max: u64) -> usize {
     64
 }
 
-/// Plan for one committed signed integer `v` in the exact interval
+/// Plan for one committed signed integer `v` in the interval
 /// `[lower, upper]`: the prover publishes commitments to the 64-bit limbs of
 /// `shifted = v - lower`, full limbs are proven in [0, 2^64) (exact: that IS
 /// their full width), and the top limb t (max value T = max >> 64*(L-1)) is
 /// proven two-sided: t in [0, 2^n) and T - t in [0, 2^n), which pins
-/// t in [0, T] exactly. Single-limb values (the only case for remainders)
-/// are therefore pinned to the exact interval with zero slack; multi-limb
-/// values get at most the documented +1 slack at the cap.
+/// t in [0, T] exactly. Single-limb values (the only case for remainders,
+/// which require exactness) are pinned with zero slack. For multi-limb
+/// values the enforced bound is (T+1)*2^(64*(L-1)) - 1, i.e. a slack of
+/// 2^64 - 1 - (max mod 2^64) above `max` in general; `limb_plan` REJECTS
+/// any multi-limb width whose slack exceeds 1, so the only admitted
+/// multi-limb intervals are the quotient caps `max = 2^k - 2` (slack
+/// exactly +1, harmless: the quotient is uniquely determined by the
+/// exactly-pinned remainder equation, and field-safety margins already
+/// cover max + 1).
 struct LimbPlan {
     limb_maxes: Vec<u64>, // per limb: max admissible value
 }
@@ -325,6 +356,18 @@ fn limb_plan(width: &BigInt) -> Result<LimbPlan, NativeError> {
         ));
     }
     let limbs = bits.div_ceil(64);
+    if limbs > 1 {
+        // Enforce the documented at-most-+1 slack: the low limbs cover
+        // [0, 2^(64*(L-1)) - 1] exactly, so the slack above `max` is
+        // 2^(64*(L-1)) - 1 - (max mod 2^(64*(L-1))).
+        let low_mask = (BigUint::from(1u8) << (64 * (limbs - 1))) - 1u8;
+        let slack = &low_mask - (&max & &low_mask);
+        if slack > BigUint::from(1u8) {
+            return Err(NativeError::InvalidDimensions(
+                "multi-limb range interval would exceed the +1 slack bound".into(),
+            ));
+        }
+    }
     let mut limb_maxes = vec![u64::MAX; limbs];
     let top = &max >> (64 * (limbs - 1));
     let top: u64 = top.try_into().expect("top limb fits u64");
@@ -804,14 +847,31 @@ fn validate_adapter_input(input: &AdapterCommitmentInput) -> Result<(), NativeEr
 /// Bound every integer magnitude appearing in a projected per-element
 /// equation: |<x, A_k>| <= in*V^2, |s*u + rem| <= s*(2I+2), |<B_j, u>| <=
 /// rank*V*(2I+2), |num*w| <= |num|*(2I+2), |den*delta + rem| <= den*(V+1).
+/// Hard dimension caps: orders of magnitude beyond any model layer in use
+/// (largest practical LoRA target is an embedding of a few hundred thousand
+/// rows), but small enough that proving/verification allocations stay
+/// bounded even for hostile inputs.
+const MAX_DIM: usize = 1 << 22;
+const MAX_RANK: usize = 1 << 16;
+const MAX_WEIGHTS: usize = 1 << 26;
+
 fn validate_field_safety_v4(
     in_dim: usize,
     rank: usize,
-    _out_dim: usize,
+    out_dim: usize,
     config: &FixedPointConfig,
     scaling_num: i64,
     scaling_den: i64,
 ) -> Result<(), NativeError> {
+    if in_dim > MAX_DIM
+        || out_dim > MAX_DIM
+        || rank > MAX_RANK
+        || rank.saturating_mul(in_dim) + out_dim.saturating_mul(rank) > MAX_WEIGHTS
+    {
+        return Err(NativeError::InvalidDimensions(
+            "adapter dimensions exceed sigma-v4 limits".into(),
+        ));
+    }
     let value_bits = config.value_bits as usize;
     let intermediate_bits = config.intermediate_bits as usize;
     let log_in = usize::BITS as usize - in_dim.leading_zeros() as usize;
@@ -838,6 +898,7 @@ fn adapter_secrets(
     salt: &[u8; 32],
 ) -> Result<AdapterSecrets, NativeError> {
     validate_adapter_input(input)?;
+    let blinding_key = adapter_blinding_key(input, salt)?;
     let rank = input.a.len();
     let in_dim = input.a[0].len();
     let out_dim = input.b.len();
@@ -847,10 +908,10 @@ fn adapter_secrets(
     let shift = scalar_from_bigint(&value_bound)?;
 
     let row_blindings_a: Vec<Scalar> = (0..rank)
-        .map(|k| derived_blinding(salt, "row-a", k as u64))
+        .map(|k| derived_blinding(&blinding_key, "row-a", k as u64))
         .collect();
     let row_blindings_b: Vec<Scalar> = (0..out_dim)
-        .map(|j| derived_blinding(salt, "row-b", j as u64))
+        .map(|j| derived_blinding(&blinding_key, "row-b", j as u64))
         .collect();
     let row_commitments_a: Vec<[u8; 32]> = input
         .a
@@ -903,7 +964,7 @@ fn adapter_secrets(
         .copied()
         .collect();
     let weight_blindings: Vec<Scalar> = (0..weights.len())
-        .map(|i| derived_blinding(salt, "weight", i as u64))
+        .map(|i| derived_blinding(&blinding_key, "weight", i as u64))
         .collect();
     let weight_commitments: Vec<[u8; 32]> = weights
         .par_iter()
@@ -1904,8 +1965,19 @@ fn verify_invocation_inner(
     }
     verify_adapter_setup(setup)?;
 
-    let proof: InvocationProof =
-        bincode::deserialize(proof_bytes).map_err(|e| NativeError::Json(e.to_string()))?;
+    // Bound deserialization by the input size: bincode pre-allocates
+    // collections from length prefixes, so an attacker-supplied blob could
+    // otherwise demand far more memory than its own length. The options
+    // mirror `bincode::serialize`'s wire format (fixint, trailing allowed).
+    let proof: InvocationProof = {
+        use bincode::Options;
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(proof_bytes.len().saturating_mul(2) as u64)
+            .deserialize(proof_bytes)
+            .map_err(|e| NativeError::Json(e.to_string()))?
+    };
     if (proof.c_w.is_some() == ctx.trivial_scaling) || (proof.c_remf.is_some() != ctx.has_remf) {
         return Err(NativeError::InvalidDimensions(
             "proof scaling structure mismatch".into(),
@@ -2246,8 +2318,8 @@ pub fn verify_v4_bytes(
     // artifact of a module; cache the parsed setup (and its commitment
     // string) by content hash. The hash covers the full JSON, so a
     // different setup can never alias a cache entry.
-    static CACHE: OnceLock<Mutex<BoundedCache<[u8; 32], (AdapterSetupPub, String)>>> =
-        OnceLock::new();
+    type ParsedSetup = (AdapterSetupPub, String);
+    static CACHE: OnceLock<Mutex<BoundedCache<[u8; 32], ParsedSetup>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BoundedCache::new(16)));
     let key = *blake3::hash(setup_json.as_bytes()).as_bytes();
     let cached = {
@@ -2494,5 +2566,110 @@ mod tests {
         parsed.x[0] = 1 << 40; // exceeds 24-bit value bound
         let bad = serde_json::to_string(&parsed).unwrap();
         assert!(prove_v4_bytes(&bad, &witness, &salt).is_err());
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    fn adapter(in_dim: usize, rank: usize, out_dim: usize, tweak: i64) -> AdapterCommitmentInput {
+        AdapterCommitmentInput {
+            schema_version: SIGMA_SCHEMA_VERSION,
+            in_dim,
+            rank,
+            out_dim,
+            fixed_point: FixedPointConfig {
+                scale_bits: 4,
+                value_bits: 16,
+                intermediate_bits: 40,
+            },
+            scaling_num: 1,
+            scaling_den: 1,
+            a: (0..rank)
+                .map(|k| {
+                    (0..in_dim)
+                        .map(|j| (k * in_dim + j) as i64 + tweak)
+                        .collect()
+                })
+                .collect(),
+            b: (0..out_dim)
+                .map(|j| (0..rank).map(|k| (j * rank + k) as i64).collect())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn same_shape_adapters_share_no_blindings() {
+        // Two same-shaped adapters under one salt differ only in the A
+        // matrix. If blindings depended only on (salt, index), every
+        // commitment at an unchanged index would collide, and the
+        // difference at a changed index would open to (w1 - w2) * B with
+        // zero blinding, leaking exact weight differences from the public
+        // manifest.
+        let salt = [9u8; 32];
+        let first = adapter(3, 2, 3, 0);
+        let second = adapter(3, 2, 3, 1); // shifts every A entry by 1
+        let s1 = adapter_secrets(&first, &salt).unwrap();
+        let s2 = adapter_secrets(&second, &salt).unwrap();
+
+        // B matrices are identical across the two adapters; their
+        // commitments must still differ at every index (independent
+        // blindings), and so must every row commitment.
+        let a_values = 2 * 3;
+        for (c1, c2) in s1.core.weight_commitments[a_values..]
+            .iter()
+            .zip(s2.core.weight_commitments[a_values..].iter())
+        {
+            assert_ne!(
+                c1, c2,
+                "identical weights must not produce equal commitments"
+            );
+        }
+        for (c1, c2) in s1
+            .core
+            .row_commitments_b
+            .iter()
+            .zip(s2.core.row_commitments_b.iter())
+        {
+            assert_ne!(c1, c2);
+        }
+        // And the difference at a changed A index must not open to
+        // delta_w * B (which a manifest holder could brute-force).
+        let delta_w = Scalar::one(); // w2 - w1 = 1 at every A index
+        let c1 = decompress(&s1.core.weight_commitments[0]).unwrap();
+        let c2 = decompress(&s2.core.weight_commitments[0]).unwrap();
+        assert_ne!(c2 - c1, &delta_w * &RISTRETTO_BASEPOINT_TABLE);
+    }
+
+    #[test]
+    fn oversized_dimensions_rejected() {
+        let statement = NativeStatement {
+            x: vec![0],
+            delta: vec![0],
+            fixed_point: FixedPointConfig {
+                scale_bits: 4,
+                value_bits: 16,
+                intermediate_bits: 40,
+            },
+            rank: MAX_RANK + 1,
+            scaling_num: 1,
+            scaling_den: 1,
+            adapter_commitment: "0".repeat(64),
+            statement_digest: "ab".repeat(32),
+        };
+        let json = serde_json::to_string(&statement).unwrap();
+        assert!(statement_context(&json).is_err());
+    }
+
+    #[test]
+    fn limb_plan_enforces_slack_invariant() {
+        // Single-limb widths: always exact, any value admitted.
+        assert!(limb_plan(&BigInt::from(12345)).is_ok());
+        // Quotient-cap form 2^k - 2: slack exactly +1, admitted.
+        assert!(limb_plan(&((BigInt::from(1) << 127) - 2)).is_ok());
+        // Sloppy multi-limb width (2^70): low limbs would admit values up
+        // to ~2^70 + 2^64 above the cap; must be rejected.
+        assert!(limb_plan(&(BigInt::from(1) << 70)).is_err());
     }
 }

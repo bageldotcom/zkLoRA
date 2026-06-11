@@ -377,7 +377,9 @@ fn constraints_eval(w: &LinearWitness, p: &PublicData) -> Vec<Scalar> {
         };
         out.push(round_sum - claim);
     }
-    // sumcheck B final: g_m(r_m) == eqv_b * (alpha*E_h - z - 1)
+    // sumcheck B final: g_m(r_m) == eqv_b * (alpha*E_h - z - es), where es
+    // is the public real-slot-indicator MLE evaluated at r (the -es constant
+    // lands in `constraint_constants`).
     let last_b = poly_eval4(
         w.cb.last().expect("at least one round"),
         p.rs_b.last().expect("at least one round"),
@@ -565,6 +567,14 @@ pub(crate) fn prove(
 
     transcript.append_message(b"logup", b"v1");
     transcript.append_u64(b"logup-n", n_pad as u64);
+    // Bind the entries this engine is proving directly into its own
+    // transcript (defense in depth: the caller already absorbed every class
+    // commitment, but the recomposition challenge rho must be sound even if
+    // this engine is ever reused on a transcript that did not).
+    for entry in entries {
+        transcript.append_u64(b"logup-entry-bits", entry.n as u64);
+        transcript.append_message(b"logup-entry-commitment", &entry.commitment);
+    }
     let b_d = random_scalar();
     let b_m = random_scalar();
     let (c_d, c_m) = rayon::join(
@@ -923,6 +933,10 @@ pub(crate) fn verify(
 
     transcript.append_message(b"logup", b"v1");
     transcript.append_u64(b"logup-n", n_pad as u64);
+    for entry in entries {
+        transcript.append_u64(b"logup-entry-bits", entry.n as u64);
+        transcript.append_message(b"logup-entry-commitment", &entry.commitment);
+    }
     transcript.append_message(b"logup-c-d", &proof.c_d);
     transcript.append_message(b"logup-c-m", &proof.c_m);
     let alpha = transcript_scalar(transcript, b"logup-alpha");
@@ -1009,6 +1023,18 @@ pub(crate) fn verify(
             Ok(vector_commit(sigma, sigma_b)
                 == decompress(announcement)? + decompress(commitment)? * c)
         };
+    // Pad coordinates of d and h are public zeros by construction (zero
+    // recomposition weight, indicator-gated lookup). Soundness does not
+    // depend on it, but enforcing it here turns the convention into a
+    // checked invariant.
+    let real_len = layout.positions.len();
+    if schnorr.sigma_d[real_len..]
+        .iter()
+        .chain(schnorr.sigma_h[real_len..].iter())
+        .any(|s| *s != Scalar::zero())
+    {
+        return Err(fail("nonzero pad response"));
+    }
     type VectorCheck<'a> = (
         &'a [Scalar],
         &'a Scalar,
