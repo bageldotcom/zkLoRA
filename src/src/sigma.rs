@@ -60,7 +60,7 @@
 use blake3;
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_TABLE;
-use curve25519_dalek_ng::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek_ng::ristretto::{CompressedRistretto, RistrettoBasepointTable, RistrettoPoint};
 use curve25519_dalek_ng::scalar::Scalar;
 use curve25519_dalek_ng::traits::{Identity, MultiscalarMul, VartimeMultiscalarMul};
 use merlin::Transcript;
@@ -93,9 +93,16 @@ const TRANSCRIPT_LABEL: &[u8] = b"zklora-sigma-v4";
 // Generators
 // ---------------------------------------------------------------------------
 
-fn pc_gens() -> &'static PedersenGens {
+pub(crate) fn pc_gens() -> &'static PedersenGens {
     static GENS: OnceLock<PedersenGens> = OnceLock::new();
     GENS.get_or_init(PedersenGens::default)
+}
+
+/// Precomputed table for the blinding generator: fixed-base multiplication
+/// is ~5x faster than the generic path and every commitment pays one.
+pub(crate) fn blinding_table() -> &'static RistrettoBasepointTable {
+    static TABLE: OnceLock<RistrettoBasepointTable> = OnceLock::new();
+    TABLE.get_or_init(|| RistrettoBasepointTable::create(&pc_gens().B_blinding))
 }
 
 fn bp_gens() -> &'static BulletproofGens {
@@ -106,26 +113,42 @@ fn bp_gens() -> &'static BulletproofGens {
 /// Vector-commitment basis, independent of the Pedersen pair (B, B~) by
 /// construction: each point is hash-to-group output under a dedicated
 /// domain, so no discrete-log relation between any of them is known.
-fn g_basis(len: usize) -> Vec<RistrettoPoint> {
-    static CACHE: OnceLock<Mutex<Vec<RistrettoPoint>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    let mut guard = cache.lock().expect("basis cache poisoned");
-    if guard.len() < len {
-        let start = guard.len();
-        let extra: Vec<RistrettoPoint> = (start..len)
-            .into_par_iter()
-            .map(|index| {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(b"zklora-sigma-v4 row basis");
-                hasher.update(&(index as u64).to_le_bytes());
-                let mut bytes = [0u8; 64];
-                hasher.finalize_xof().fill(&mut bytes);
-                RistrettoPoint::from_uniform_bytes(&bytes)
-            })
-            .collect();
-        guard.extend(extra);
+///
+/// The lock is never held across the parallel generation: a rayon worker
+/// that holds a lock while waiting on stolen subtasks can steal another job
+/// that blocks on the same lock, deadlocking the pool. Racing growers may
+/// duplicate generation work; the points are deterministic, so the longest
+/// result simply wins.
+pub(crate) fn g_basis(len: usize) -> std::sync::Arc<Vec<RistrettoPoint>> {
+    use std::sync::{Arc, RwLock};
+    static CACHE: OnceLock<RwLock<Arc<Vec<RistrettoPoint>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(Arc::new(Vec::new())));
+    let current = {
+        let guard = cache.read().expect("basis cache poisoned");
+        guard.clone()
+    };
+    if current.len() >= len {
+        return current;
     }
-    guard[..len].to_vec()
+    let extra: Vec<RistrettoPoint> = (current.len()..len)
+        .into_par_iter()
+        .map(|index| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"zklora-sigma-v4 row basis");
+            hasher.update(&(index as u64).to_le_bytes());
+            let mut bytes = [0u8; 64];
+            hasher.finalize_xof().fill(&mut bytes);
+            RistrettoPoint::from_uniform_bytes(&bytes)
+        })
+        .collect();
+    let mut grown = current.as_ref().clone();
+    grown.extend(extra);
+    let grown = Arc::new(grown);
+    let mut guard = cache.write().expect("basis cache poisoned");
+    if guard.len() < grown.len() {
+        *guard = grown.clone();
+    }
+    guard.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -158,18 +181,39 @@ fn scalar_from_i64(value: i64) -> Scalar {
     }
 }
 
-fn compress(point: &RistrettoPoint) -> [u8; 32] {
+/// Variable-time MSM, split across rayon workers for large inputs. Splitting
+/// an MSM into chunks and summing partial results is exact; per-chunk
+/// Pippenger loses a little batching efficiency but wall time wins ~cores.
+pub(crate) fn par_msm(scalars: &[Scalar], points: &[RistrettoPoint]) -> RistrettoPoint {
+    debug_assert_eq!(scalars.len(), points.len());
+    if scalars.len() < 1024 {
+        return RistrettoPoint::vartime_multiscalar_mul(scalars.iter(), points.iter());
+    }
+    let chunk = scalars.len().div_ceil(rayon::current_num_threads().max(1));
+    scalars
+        .par_chunks(chunk)
+        .zip(points.par_chunks(chunk))
+        .map(|(s, p)| RistrettoPoint::vartime_multiscalar_mul(s.iter(), p.iter()))
+        .reduce(RistrettoPoint::identity, |a, b| a + b)
+}
+
+pub(crate) fn compress(point: &RistrettoPoint) -> [u8; 32] {
     point.compress().to_bytes()
 }
 
-fn decompress(bytes: &[u8; 32]) -> Result<RistrettoPoint, NativeError> {
+pub(crate) fn decompress(bytes: &[u8; 32]) -> Result<RistrettoPoint, NativeError> {
     CompressedRistretto(*bytes)
         .decompress()
         .ok_or_else(|| NativeError::InvalidDimensions("invalid ristretto point".into()))
 }
 
-fn random_scalar() -> Scalar {
-    Scalar::random(&mut OsRng)
+pub(crate) fn random_scalar() -> Scalar {
+    use rand_core::SeedableRng;
+    thread_local! {
+        static RNG: std::cell::RefCell<rand_chacha::ChaCha12Rng> =
+            std::cell::RefCell::new(rand_chacha::ChaCha12Rng::from_rng(OsRng).expect("seed rng"));
+    }
+    RNG.with(|rng| Scalar::random(&mut *rng.borrow_mut()))
 }
 
 /// Deterministic blinding factors for adapter commitments: keyed BLAKE3 over
@@ -184,13 +228,13 @@ fn derived_blinding(salt: &[u8; 32], domain: &str, index: u64) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&bytes)
 }
 
-fn transcript_scalar(transcript: &mut Transcript, label: &'static [u8]) -> Scalar {
+pub(crate) fn transcript_scalar(transcript: &mut Transcript, label: &'static [u8]) -> Scalar {
     let mut bytes = [0u8; 64];
     transcript.challenge_bytes(label, &mut bytes);
     Scalar::from_bytes_mod_order_wide(&bytes)
 }
 
-fn transcript_scalars(
+pub(crate) fn transcript_scalars(
     transcript: &mut Transcript,
     label: &'static [u8],
     count: usize,
@@ -204,7 +248,7 @@ fn transcript_scalars(
         .collect()
 }
 
-fn absorb_points(transcript: &mut Transcript, label: &'static [u8], points: &[[u8; 32]]) {
+pub(crate) fn absorb_points(transcript: &mut Transcript, label: &'static [u8], points: &[[u8; 32]]) {
     transcript.append_u64(b"count", points.len() as u64);
     for point in points {
         transcript.append_message(label, point);
@@ -232,11 +276,11 @@ fn parse_salt(salt_hex: &str) -> Result<[u8; 32], NativeError> {
 
 /// One Bulletproof entry: a committed u64 proven to lie in [0, 2^n).
 #[derive(Clone)]
-struct RangeEntry {
-    n: usize,
-    value: u64,        // prover side only (0 on verify)
-    blinding: Scalar,  // prover side only
-    commitment: [u8; 32],
+pub(crate) struct RangeEntry {
+    pub(crate) n: usize,
+    pub(crate) value: u64,       // prover side only (0 on verify)
+    pub(crate) blinding: Scalar, // prover side only
+    pub(crate) commitment: [u8; 32],
 }
 
 fn min_bp_bits(max: u64) -> usize {
@@ -309,7 +353,7 @@ impl BoundedClass {
     /// Prover-side construction: commit every limb of every shifted value.
     fn commit(values: &[BigInt], lower: &BigInt, width: &BigInt) -> Result<Self, NativeError> {
         let plan = limb_plan(width)?;
-        let gens = pc_gens();
+        let _ = pc_gens();
         let results: Vec<CommittedValue> = values
             .par_iter()
             .map(|value| {
@@ -331,9 +375,8 @@ impl BoundedClass {
                 let shift_64 = Scalar::from(u64::MAX) + Scalar::one();
                 for limb in &limbs {
                     let blinding = random_scalar();
-                    let commitment =
-                        &Scalar::from(*limb) * &RISTRETTO_BASEPOINT_TABLE
-                            + gens.B_blinding * blinding;
+                    let commitment = &Scalar::from(*limb) * &RISTRETTO_BASEPOINT_TABLE
+                        + blinding_table() * &blinding;
                     commitments.push(compress(&commitment));
                     openings.push((*limb, blinding));
                     value_blinding += base * blinding;
@@ -411,47 +454,102 @@ impl BoundedClass {
         }
     }
 
-    /// Emit Bulletproof entries: full limbs one-sided (exact), partial top
-    /// limbs two-sided with a derived twin commitment max*B - C.
+    /// Emit range entries: full limbs one-sided (exact), partial top limbs
+    /// two-sided with a derived twin commitment max*B - C.
     fn push_entries(&self, entries: &mut Vec<RangeEntry>) -> Result<(), NativeError> {
         let prover_side = !self.openings.is_empty();
-        for index in 0..self.commitments.len() {
-            for (limb_index, max) in self.plan.limb_maxes.iter().enumerate() {
-                let n = min_bp_bits(*max);
-                let commitment = self.commitments[index][limb_index];
-                let (value, blinding) = if prover_side {
-                    self.openings[index][limb_index]
-                } else {
-                    (0, Scalar::zero())
-                };
-                entries.push(RangeEntry {
-                    n,
-                    value,
-                    blinding,
-                    commitment,
-                });
-                if *max != u64::MAX {
-                    // Twin: max - v with blinding -b; commitment derived so
-                    // the verifier needs no extra published data.
-                    let twin = &Scalar::from(*max) * &RISTRETTO_BASEPOINT_TABLE
-                        - decompress(&commitment)?;
-                    entries.push(RangeEntry {
+        let per_value: Vec<Vec<RangeEntry>> = (0..self.commitments.len())
+            .into_par_iter()
+            .map(|index| {
+                let mut local = Vec::with_capacity(self.plan.limb_maxes.len() * 2);
+                for (limb_index, max) in self.plan.limb_maxes.iter().enumerate() {
+                    let n = min_bp_bits(*max);
+                    let commitment = self.commitments[index][limb_index];
+                    let (value, blinding) = if prover_side {
+                        self.openings[index][limb_index]
+                    } else {
+                        (0, Scalar::zero())
+                    };
+                    local.push(RangeEntry {
                         n,
-                        value: max.wrapping_sub(value),
-                        blinding: -blinding,
-                        commitment: compress(&twin),
+                        value,
+                        blinding,
+                        commitment,
                     });
+                    if *max != u64::MAX {
+                        // Twin: max - v with blinding -b; commitment derived
+                        // so the verifier needs no extra published data.
+                        let twin = &Scalar::from(*max) * &RISTRETTO_BASEPOINT_TABLE
+                            - decompress(&commitment)?;
+                        local.push(RangeEntry {
+                            n,
+                            value: max.wrapping_sub(value),
+                            blinding: -blinding,
+                            commitment: compress(&twin),
+                        });
+                    }
                 }
-            }
+                Ok(local)
+            })
+            .collect::<Result<_, NativeError>>()?;
+        for mut local in per_value {
+            entries.append(&mut local);
         }
         Ok(())
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct RangeBundle {
-    /// (n, chunk proofs), in the deterministic plan order.
-    groups: Vec<(usize, Vec<Vec<u8>>)>,
+enum RangeBundle {
+    /// Aggregated Bulletproofs grouped by bit width: (n, chunk proofs) in
+    /// the deterministic plan order. Compact (log-size) but ~ms per entry;
+    /// always used for the one-time adapter setup, where artifact size
+    /// matters more than the amortized-to-zero proving time.
+    Bulletproofs { groups: Vec<(usize, Vec<Vec<u8>>)> },
+    /// Sumcheck-based LogUp lookup argument: microseconds of field work per
+    /// entry plus a few MSMs; the default for per-invocation proofs. Both
+    /// engines prove the identical statement (every committed value in its
+    /// exact interval) under the same discrete-log + Fiat-Shamir
+    /// assumptions, and the verifier accepts either.
+    LogUp(Box<crate::logup::LogUpProof>),
+}
+
+/// Range engine for invocation proofs: LogUp by default for proving speed;
+/// ZKLORA_RANGE_ENGINE=bulletproofs opts into compact proofs instead.
+fn invocation_range_engine() -> &'static str {
+    static ENGINE: OnceLock<String> = OnceLock::new();
+    ENGINE.get_or_init(|| match std::env::var("ZKLORA_RANGE_ENGINE").ok().as_deref() {
+        Some("bulletproofs") => "bulletproofs".to_string(),
+        _ => "logup".to_string(),
+    })
+}
+
+fn prove_ranges_with_engine(
+    transcript: &Transcript,
+    entries: Vec<RangeEntry>,
+    engine: &str,
+) -> Result<RangeBundle, NativeError> {
+    if engine == "logup" {
+        let mut fork = transcript.clone();
+        return Ok(RangeBundle::LogUp(Box::new(crate::logup::prove(
+            &mut fork, &entries,
+        )?)));
+    }
+    prove_ranges(transcript, entries)
+}
+
+fn verify_range_bundle(
+    transcript: &Transcript,
+    entries: Vec<RangeEntry>,
+    bundle: &RangeBundle,
+) -> Result<(), NativeError> {
+    match bundle {
+        RangeBundle::LogUp(proof) => {
+            let mut fork = transcript.clone();
+            crate::logup::verify(&mut fork, &entries, proof)
+        }
+        RangeBundle::Bulletproofs { .. } => verify_ranges(transcript, entries, bundle),
+    }
 }
 
 /// Deterministic chunk plan: Bulletproofs aggregation requires a
@@ -526,7 +624,7 @@ fn prove_ranges(
             Ok((n, chunks))
         })
         .collect::<Result<Vec<_>, NativeError>>()?;
-    Ok(RangeBundle { groups: proved })
+    Ok(RangeBundle::Bulletproofs { groups: proved })
 }
 
 fn verify_ranges(
@@ -534,11 +632,16 @@ fn verify_ranges(
     entries: Vec<RangeEntry>,
     bundle: &RangeBundle,
 ) -> Result<(), NativeError> {
+    let RangeBundle::Bulletproofs { groups } = bundle else {
+        return Err(NativeError::InvalidDimensions(
+            "expected bulletproofs range bundle".into(),
+        ));
+    };
     let expected = group_entries(&entries);
-    if expected.len() != bundle.groups.len()
+    if expected.len() != groups.len()
         || expected
             .iter()
-            .zip(bundle.groups.iter())
+            .zip(groups.iter())
             .any(|((n_expected, group), (n_actual, chunks))| {
                 n_expected != n_actual || chunk_plan(group.len()).len() != chunks.len()
             })
@@ -549,7 +652,7 @@ fn verify_ranges(
     }
     expected
         .into_par_iter()
-        .zip(bundle.groups.par_iter())
+        .zip(groups.par_iter())
         .try_for_each(|((n, group), (_, chunks))| {
             chunk_plan(group.len())
                 .into_par_iter()
@@ -799,9 +902,7 @@ fn adapter_secrets(
         .zip(weight_blindings.par_iter())
         .map(|(w, blinding)| {
             let shifted = scalar_from_i64(*w) + shift;
-            compress(
-                &(&shifted * &RISTRETTO_BASEPOINT_TABLE + gens.B_blinding * blinding),
-            )
+            compress(&(&shifted * &RISTRETTO_BASEPOINT_TABLE + blinding_table() * blinding))
         })
         .collect();
 
@@ -876,7 +977,7 @@ fn prove_link(
     let rho_t = random_scalar();
     let r1 = RistrettoPoint::multiscalar_mul(
         rho.iter().chain(std::iter::once(&rho_s)),
-        basis.iter().chain(std::iter::once(&gens.B_blinding)),
+        basis[..cols].iter().chain(std::iter::once(&gens.B_blinding)),
     );
     let mu_rho: Scalar = mu.iter().zip(rho.iter()).map(|(m, r)| m * r).sum();
     let r2 = &mu_rho * &RISTRETTO_BASEPOINT_TABLE + gens.B_blinding * rho_t;
@@ -944,7 +1045,7 @@ fn verify_link(
 
     let lhs1 = RistrettoPoint::vartime_multiscalar_mul(
         proof.sigma_z.iter().chain(std::iter::once(&proof.sigma_s)),
-        basis.iter().chain(std::iter::once(&gens.B_blinding)),
+        basis[..cols].iter().chain(std::iter::once(&gens.B_blinding)),
     );
     if lhs1 != decompress(&proof.r1)? + p1 * c {
         return Err(NativeError::Halo2("adapter link proof (rows) failed".into()));
@@ -1294,13 +1395,28 @@ fn projected_commitments(
                 .iter(),
         ))
     };
+    // One flat MSM per class: sum_j s_j * (sum_i 2^(64 i) C_{j,i} + lower*B)
+    // = sum_{j,i} (s_j 2^(64 i)) C_{j,i} + lower*(sum_j s_j)*B.
     let combine_class =
         |scalars: &[Scalar], class: &BoundedClass| -> Result<RistrettoPoint, NativeError> {
-            let mut acc = RistrettoPoint::identity();
-            for (scalar, index) in scalars.iter().zip(0..class.commitments.len()) {
-                acc += class.value_commitment(index)? * scalar;
+            let limbs = class.plan.limb_maxes.len();
+            let shift_64 = Scalar::from(u64::MAX) + Scalar::one();
+            let mut msm_scalars = Vec::with_capacity(scalars.len() * limbs + 1);
+            let mut msm_points = Vec::with_capacity(scalars.len() * limbs + 1);
+            for (scalar, limb_row) in scalars.iter().zip(class.commitments.iter()) {
+                let mut base = *scalar;
+                for limb in limb_row {
+                    msm_scalars.push(base);
+                    msm_points.push(decompress(limb)?);
+                    base *= shift_64;
+                }
             }
-            Ok(acc)
+            msm_scalars.push(scalar_from_bigint(&class.lower)? * scalars.iter().sum::<Scalar>());
+            msm_points.push(pc_gens().B);
+            Ok(RistrettoPoint::vartime_multiscalar_mul(
+                msm_scalars.iter(),
+                msm_points.iter(),
+            ))
         };
     let d_u: Vec<RistrettoPoint> = (0..ctx.rank)
         .map(|k| u.value_commitment(k))
@@ -1333,6 +1449,14 @@ pub fn prove_invocation(
     witness_json: &str,
     salt: &[u8; 32],
 ) -> Result<Vec<u8>, NativeError> {
+    let timing = std::env::var("ZKLORA_V4_TIMING").is_ok();
+    let mut mark = std::time::Instant::now();
+    let mut lap = |label: &str| {
+        if timing {
+            eprintln!("  prove {label}: {:?}", mark.elapsed());
+        }
+        mark = std::time::Instant::now();
+    };
     let ctx = statement_context(statement_json)?;
     let witness: NativeWitness =
         serde_json::from_str(witness_json).map_err(|e| NativeError::Json(e.to_string()))?;
@@ -1362,6 +1486,7 @@ pub fn prove_invocation(
             "witness does not match statement adapter commitment".into(),
         ));
     }
+    lap("setup");
 
     // --- exact reference pipeline (arbitrary precision) -------------------
     let scale = &ctx.scale;
@@ -1432,6 +1557,7 @@ pub fn prove_invocation(
         None
     };
 
+    lap("pipeline+commit");
     let mut transcript = invocation_transcript(statement_json, &ctx);
     rema.absorb(&mut transcript, b"c-rema");
     u.absorb(&mut transcript, b"c-u");
@@ -1535,7 +1661,7 @@ pub fn prove_invocation(
             .chain(std::iter::once(&gens.B_blinding)),
     );
     let commit_pair = |value: &Scalar, blinding: &Scalar| -> RistrettoPoint {
-        value * &RISTRETTO_BASEPOINT_TABLE + gens.B_blinding * blinding
+        value * &RISTRETTO_BASEPOINT_TABLE + blinding_table() * blinding
     };
     let r_su = commit_pair(&rho_su, &rho_bsu);
     let r_sra = commit_pair(&rho_sra, &rho_bsra);
@@ -1652,6 +1778,7 @@ pub fn prove_invocation(
             .collect(),
         omega,
     };
+    lap("sigma-protocols");
     // Absorb responses so the range-proof transcripts bind the sigma layer.
     for scalar in linear
         .sigma_a
@@ -1674,7 +1801,9 @@ pub fn prove_invocation(
     if let Some(class) = &remf {
         class.push_entries(&mut entries)?;
     }
-    let ranges = prove_ranges(&transcript, entries)?;
+    lap("push-entries");
+    let ranges = prove_ranges_with_engine(&transcript, entries, invocation_range_engine())?;
+    lap("ranges");
 
     let proof = InvocationProof {
         c_rema: rema.commitments,
@@ -1981,7 +2110,7 @@ fn verify_invocation_inner(
     if let Some(class) = &remf {
         class.push_entries(&mut entries)?;
     }
-    verify_ranges(&transcript, entries, &proof.ranges)
+    verify_range_bundle(&transcript, entries, &proof.ranges)
 }
 
 // ---------------------------------------------------------------------------
@@ -2002,8 +2131,19 @@ fn cached_adapter_secrets(
             .as_bytes(),
     );
     let key = *hasher.finalize().as_bytes();
+    // Never hold the cache lock across the (parallel) derivation: rayon
+    // workers blocked on this mutex while the holder waits for stolen
+    // subtasks can deadlock the pool. Racing derivations are deterministic,
+    // so a duplicate insert is harmless.
+    {
+        let mut guard = cache.lock().expect("adapter secrets cache poisoned");
+        if let Some(hit) = guard.peek(&key) {
+            return Ok(hit);
+        }
+    }
+    let secrets = adapter_secrets(input, salt)?;
     let mut guard = cache.lock().expect("adapter secrets cache poisoned");
-    guard.get_or_create(&key, || adapter_secrets(input, salt))
+    guard.get_or_create(&key, || Ok::<_, NativeError>(secrets))
 }
 
 // ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ merlin = "3"
 curve25519-dalek-ng = "4"
 bincode = "1"
 base64 = "0.22.1"
+rand_chacha = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
