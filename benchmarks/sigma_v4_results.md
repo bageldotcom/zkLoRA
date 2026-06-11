@@ -55,6 +55,26 @@ aggregated exact range proof for every weight, and a linking proof.
 This artifact ships inside the pinned adapter manifest; it contains no
 weight or salt material.
 
+## Real-model end-to-end (distilgpt2 + ng0-k1/distilgpt2-finetuned-es)
+
+The full quickstart flow from the README — contributor server, base-model
+client over sockets, native proof generation, CLI verification — run on the
+same 4-core host. The adapter has six rank-16 768×2304 c_attn modules
+(~49k quantized weights each); under v3 a single such module exceeded the
+host by an order of magnitude (estimated >200 GB of params/keys), so none
+of this was previously possible on any realistic machine.
+
+| stage | wall time |
+|---|---|
+| manifest write incl. one-time adapter setup proofs, 6 modules | ~6 min (one-time per adapter) |
+| inference + proof generation, 60 invocation proofs (6 modules × 10 token rows) | 62 s |
+| verification of all 60 proofs incl. one-time adapter-setup verification | 162 s |
+
+A byte-flipped proof artifact is rejected
+(`proof bytes failed native sigma-v4 verification`), as are tampered
+statements, transcripts, manifests, and verification keys (covered by the
+test suites).
+
 ## Range engines
 
 Per-invocation proofs default to the sumcheck-based LogUp range engine
