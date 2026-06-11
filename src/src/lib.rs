@@ -27,6 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::convert::TryInto;
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub(crate) mod logup;
 pub mod sigma;
 
 const ADAPTER_COMMITMENT_DOMAIN: u64 = 0x5a4b4c4f5241; // "ZKLORA"
@@ -87,6 +88,12 @@ impl<K: Clone + std::hash::Hash + Eq, V> BoundedCache<K, V> {
         }
     }
 
+    /// Cache lookup without creation, for callers that must not run the
+    /// constructor while holding the cache lock.
+    pub(crate) fn peek(&mut self, key: &K) -> Option<Arc<V>> {
+        self.map.get(key).cloned()
+    }
+
     pub(crate) fn get_or_create<E>(
         &mut self,
         key: &K,
@@ -115,13 +122,23 @@ fn cache_cap(env_var: &str, default: usize) -> usize {
         .max(1)
 }
 
+// Cache lookups never hold their lock across construction: params/keygen use
+// rayon internally, and a rayon worker blocked on the cache mutex while the
+// lock holder waits for stolen subtasks can deadlock the whole pool. Racing
+// constructions are deterministic, so a duplicate insert is harmless.
+
 fn params_for(k: u32) -> Arc<Params<EqAffine>> {
     static CACHE: OnceLock<Mutex<BoundedCache<u32, Params<EqAffine>>>> = OnceLock::new();
     let cache = CACHE
         .get_or_init(|| Mutex::new(BoundedCache::new(cache_cap("ZKLORA_PARAMS_CACHE_CAP", 4))));
-    let mut guard = cache.lock().expect("params cache poisoned");
-    guard
-        .get_or_create::<std::convert::Infallible>(&k, || Ok(Params::new(k)))
+    if let Some(hit) = cache.lock().expect("params cache poisoned").peek(&k) {
+        return hit;
+    }
+    let params = Params::new(k);
+    cache
+        .lock()
+        .expect("params cache poisoned")
+        .get_or_create::<std::convert::Infallible>(&k, || Ok(params))
         .expect("params creation is infallible")
 }
 
@@ -133,11 +150,15 @@ fn proving_key_for(
     static CACHE: OnceLock<Mutex<BoundedCache<CircuitKey, ProvingKey<EqAffine>>>> = OnceLock::new();
     let cache =
         CACHE.get_or_init(|| Mutex::new(BoundedCache::new(cache_cap("ZKLORA_PK_CACHE_CAP", 2))));
-    let mut guard = cache.lock().expect("pk cache poisoned");
-    guard.get_or_create(key, || {
-        let vk = keygen_vk(params, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
-        keygen_pk(params, vk, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))
-    })
+    if let Some(hit) = cache.lock().expect("pk cache poisoned").peek(key) {
+        return Ok(hit);
+    }
+    let vk = keygen_vk(params, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    let pk = keygen_pk(params, vk, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    cache
+        .lock()
+        .expect("pk cache poisoned")
+        .get_or_create(key, || Ok::<_, NativeError>(pk))
 }
 
 fn verifying_key_for(
@@ -149,10 +170,14 @@ fn verifying_key_for(
         OnceLock::new();
     let cache =
         CACHE.get_or_init(|| Mutex::new(BoundedCache::new(cache_cap("ZKLORA_VK_CACHE_CAP", 8))));
-    let mut guard = cache.lock().expect("vk cache poisoned");
-    guard.get_or_create(key, || {
-        keygen_vk(params, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))
-    })
+    if let Some(hit) = cache.lock().expect("vk cache poisoned").peek(key) {
+        return Ok(hit);
+    }
+    let vk = keygen_vk(params, empty_circuit).map_err(|e| NativeError::Halo2(e.to_string()))?;
+    cache
+        .lock()
+        .expect("vk cache poisoned")
+        .get_or_create(key, || Ok::<_, NativeError>(vk))
 }
 
 #[derive(Debug, thiserror::Error)]
